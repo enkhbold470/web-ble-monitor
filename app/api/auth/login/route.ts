@@ -5,8 +5,9 @@ export async function POST(request: NextRequest) {
   try {
     const { username, password } = await request.json()
     
-    // Simple hardcoded authentication
-    if (username === 'admin' && password === 'admin123') {
+    // Simple authentication using environment variable
+    const adminPassword = process.env.ADMIN_PASSWORD || 'admin123' // fallback for development
+    if (username === 'admin' && password === adminPassword) {
       const cookieStore = await cookies()
       cookieStore.set('admin-auth', 'authenticated', {
         httpOnly: true,
