@@ -1,0 +1,72 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model SiteConfig {
+  id String @id @default(uuid()) @db.Uuid
+  name String
+  description String
+  tagline String
+  slogan String
+}
+
+model AuthUser {
+  id String @id @default(uuid()) @db.Uuid
+  email String @unique
+  password String
+  name String
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  role String @default("user")
+}
+
+model Participant {
+  id           String    @id @default(uuid()) @db.Uuid
+  name         String
+  authUserId   String?   @db.Uuid
+  createdAt    DateTime  @default(now()) @db.Timestamptz(6)
+  sessions     Session[]
+  consentGiven Boolean @default(false)
+  consentAt    DateTime?
+}
+
+model Session {
+  id            String           @id @default(uuid()) @db.Uuid
+  participantId String           @db.Uuid
+  startedAt     DateTime         @db.Timestamptz(6)
+  notes         String?
+  participant   Participant      @relation(fields: [participantId], references: [id])
+  eegStageData  EegStageData[]
+}
+
+model EegStageData {
+  id              String    @id @default(uuid()) @db.Uuid
+  sessionId       String    @db.Uuid
+  stageName       String
+  stageOrder      Int
+  durationSeconds Int
+  instructions    String?
+  eegData         Json?
+  createdAt       DateTime  @default(now()) @db.Timestamptz(6)
+  session         Session   @relation(fields: [sessionId], references: [id])
+}
+
+model EegData {
+  id            Int      @id @default(autoincrement())
+  userId        String   @db.Uuid
+  eegData       Json?
+  createdAt     DateTime @default(now()) @db.Timestamptz(6)
+  betaPower     Float?
+  lowBetaWarning Boolean?
+}
+
