@@ -1,8 +1,8 @@
 "use client";
-import React, { useState, useRef } from "react";
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
+import React, { useState, useRef, useMemo } from "react";
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, BarChart, Bar, Cell } from "recharts";
 import { Button } from "@/components/ui/button";
-import { processEegData } from "@/lib/eegUtils";
+import { processEegData, calculate5BandPSD, SAMPLING_RATE } from "@/lib/eegUtils";
 import { saveSessionToDatabase } from "@/app/actions/saveSession";
 
 const SERVICE_UUID = "0338ff7c-6251-4029-a5d5-24e4fa856c8d";
@@ -29,6 +29,64 @@ interface StageData {
   startTime: number;
   endTime: number;
   eegData: EegDatum[];
+}
+
+// Frequency Band Chart Component
+function FrequencyBandChart({ data }: { data: EegDatum[] }) {
+  const bandData = useMemo(() => {
+    if (data.length < 32) {
+      return [
+        { name: "Delta", value: 0, color: "#3b82f6" },
+        { name: "Theta", value: 0, color: "#8b5cf6" },
+        { name: "Alpha", value: 0, color: "#ec4899" },
+        { name: "Beta", value: 0, color: "#f59e0b" },
+        { name: "Gamma", value: 0, color: "#10b981" },
+      ];
+    }
+
+    // Use recent data for calculation (last 512 samples or available)
+    const recentData = data.slice(-512).map(d => d.value);
+    const bandPSD = calculate5BandPSD(recentData, SAMPLING_RATE);
+
+    return [
+      { name: "Delta", value: bandPSD.delta, color: "#3b82f6" },
+      { name: "Theta", value: bandPSD.theta, color: "#8b5cf6" },
+      { name: "Alpha", value: bandPSD.alpha, color: "#ec4899" },
+      { name: "Beta", value: bandPSD.beta, color: "#f59e0b" },
+      { name: "Gamma", value: bandPSD.gamma, color: "#10b981" },
+    ];
+  }, [data]);
+
+  return (
+    <div className="h-64 border border-border rounded p-2">
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={bandData} margin={{ top: 10, right: 10, left: 0, bottom: 20 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#444" />
+          <XAxis 
+            dataKey="name" 
+            tick={{ fill: "#aaa" }} 
+            axisLine={{ stroke: "#444" }}
+            tickLine={{ stroke: "#444" }}
+          />
+          <YAxis 
+            tick={{ fill: "#aaa" }} 
+            axisLine={{ stroke: "#444" }}
+            tickLine={{ stroke: "#444" }}
+            width={60}
+          />
+          <Tooltip 
+            contentStyle={{ background: "#222", border: "none", color: "#fff" }}
+            formatter={(value: number) => [value.toFixed(6), "PSD"]}
+          />
+          <Bar dataKey="value" isAnimationActive={false}>
+            {bandData.map((entry, index) => (
+              <Cell key={`cell-${index}`} fill={entry.color} />
+            ))}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  );
 }
 
 export default function BleReader() {
@@ -481,6 +539,12 @@ export default function BleReader() {
           </ResponsiveContainer>
         </div>
       </div>
+      {isStreaming && data.length >= 32 && (
+        <div className="mt-4">
+          <h3 className="font-semibold mb-2">Frequency Band PSD (5-60 Hz)</h3>
+          <FrequencyBandChart data={data} />
+        </div>
+      )}
       {sessionEnded && (
         <div className="mt-6 p-4 rounded">
           <h3 className="font-bold mb-2">Session Complete!</h3>
