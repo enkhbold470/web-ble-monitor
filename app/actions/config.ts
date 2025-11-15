@@ -55,7 +55,8 @@ export async function authenticateAdmin(formData: FormData) {
     const username = formData.get('username') as string
     const password = formData.get('password') as string
     
-    if (username === 'admin' && password === 'admin123') {
+    const adminPassword = process.env.ADMIN_PASSWORD || 'admin123' // fallback for development
+    if (username === 'admin' && password === adminPassword) {
       const cookieStore = await cookies()
       cookieStore.set('admin-auth', 'authenticated', {
         httpOnly: true,
