@@ -110,6 +110,22 @@ export default function BleReader() {
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'success' | 'error'>("idle");
   const [saveError, setSaveError] = useState<string | null>(null);
   const [awaitingContinue, setAwaitingContinue] = useState(false);
+
+  // Calculate live sampling rate
+  const liveSamplingRate = useMemo(() => {
+    if (!isStreaming || data.length < 2) return 0;
+    // Calculate sampling rate from last 10 samples
+    const recent = data.slice(-10);
+    if (recent.length < 2) return 0;
+    const timeDiffs = [];
+    for (let i = 1; i < recent.length; i++) {
+      const diff = recent[i].timestamp - recent[i - 1].timestamp;
+      if (diff > 0) timeDiffs.push(diff);
+    }
+    if (timeDiffs.length === 0) return 0;
+    const avgDiff = timeDiffs.reduce((a, b) => a + b, 0) / timeDiffs.length;
+    return avgDiff > 0 ? Math.round(1000 / avgDiff) : 0;
+  }, [data, isStreaming]);
   const stageOrderList: Stage[] = [
     "1_Baseline_Relaxed",
     "2_Cognitive_Warmup",
@@ -526,7 +542,14 @@ export default function BleReader() {
         <div className="mb-2">Error: {error}</div>
       )}
       <div className="mt-4">
-        <h3 className="font-semibold mb-2">EEG Data (Live)</h3>
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="font-semibold">EEG Data (Live)</h3>
+          {isStreaming && liveSamplingRate > 0 && (
+            <div className="text-sm text-muted-foreground font-mono">
+              Sampling: {liveSamplingRate} Hz
+            </div>
+          )}
+        </div>
         <div className="h-48 border border-border rounded p-2">
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={data} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
