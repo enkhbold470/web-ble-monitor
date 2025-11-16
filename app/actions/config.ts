@@ -1,7 +1,6 @@
 // app/actions/config.ts
 "use server"
 
-import { prisma } from '@/lib/prisma'
 import { cookies } from 'next/headers'
 
 // Custom error class for better error handling
@@ -22,21 +21,6 @@ async function withErrorHandling<T>(operation: () => Promise<T>, operationName: 
     // Handle different types of errors
     if (error instanceof AdminActionError) {
       throw error
-    }
-    
-    // Prisma specific errors
-    if (error && typeof error === 'object' && 'code' in error) {
-      const prismaError = error as any
-      switch (prismaError.code) {
-        case 'P2002':
-          throw new AdminActionError('Давхардсан утга оруулж болохгүй', 'DUPLICATE_ERROR')
-        case 'P2025':
-          throw new AdminActionError('Өгөгдөл олдсонгүй', 'NOT_FOUND')
-        case 'P1001':
-          throw new AdminActionError('Өгөгдлийн санд холбогдож чадсангүй', 'CONNECTION_ERROR')
-        default:
-          throw new AdminActionError(`Өгөгдлийн сангийн алдаа: ${prismaError.message || 'Тодорхойгүй алдаа'}`, 'DATABASE_ERROR')
-      }
     }
     
     // Network or other errors
@@ -87,16 +71,11 @@ export async function isAuthenticated() {
   }, 'isAuthenticated')
 }
 
-// Site Config Actions (keep if you use site config)
+// Site Config Actions - using static config only
 export async function getSiteConfig() {
   return withErrorHandling(async () => {
-    const config = await prisma.siteConfig.findFirst()
-    if (!config) {
-      // Fallback to static site config
-      const { siteConfig } = await import('@/config/site')
-      return siteConfig;
-    }
-    return config;
+    const { siteConfig } = await import('@/config/site')
+    return siteConfig;
   }, 'getSiteConfig')
 }
 
@@ -105,17 +84,8 @@ export async function updateSiteConfig(data: any) {
     if (!data.name || !data.description) {
       throw new AdminActionError('Нэр болон тайлбар заавал шаардлагатай', 'VALIDATION_ERROR')
     }
-    const existing = await prisma.siteConfig.findFirst()
-    let result
-    if (existing) {
-      result = await prisma.siteConfig.update({
-        where: { id: existing.id },
-        data
-      })
-    } else {
-      result = await prisma.siteConfig.create({ data })
-    }
-    return result
+    // Site config is now static only - no database updates
+    throw new AdminActionError('Site config is read-only', 'READ_ONLY')
   }, 'updateSiteConfig')
 }
 
