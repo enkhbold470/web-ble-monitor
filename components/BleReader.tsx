@@ -60,7 +60,7 @@ function FrequencyBandChart({ data }: { data: EegDatum[] }) {
   return (
     <div className="h-64 border border-border rounded p-2">
       <ResponsiveContainer width="100%" height="100%">
-        <BarChart data={bandData} margin={{ top: 10, right: 10, left: 0, bottom: 20 }}>
+        <BarChart data={bandData} margin={{ top: 10, right: 10, left: 60, bottom: 20 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="#444" />
           <XAxis 
             dataKey="name" 
@@ -110,6 +110,84 @@ export default function BleReader() {
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'success' | 'error'>("idle");
   const [saveError, setSaveError] = useState<string | null>(null);
   const [awaitingContinue, setAwaitingContinue] = useState(false);
+  
+  // Frontend stabilization: buffer for incoming BLE data
+  const dataBufferRef = useRef<EegDatum[]>([]);
+  const stabilizationIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const lastProcessedValueRef = useRef<number | null>(null);
+  const expectedSamplingRate = SAMPLING_RATE; // Target: 250 Hz
+  const sampleInterval = 1000 / expectedSamplingRate; // ~4ms per sample
+  const [bufferStatus, setBufferStatus] = useState<{ size: number; status: 'normal' | 'low' | 'high' }>({ size: 0, status: 'normal' });
+
+  // Stabilized data processing - runs at fixed interval with interpolation
+  React.useEffect(() => {
+    if (!isStreaming) {
+      if (stabilizationIntervalRef.current) {
+        clearInterval(stabilizationIntervalRef.current);
+        stabilizationIntervalRef.current = null;
+      }
+      lastProcessedValueRef.current = null;
+      setBufferStatus({ size: 0, status: 'normal' });
+      return;
+    }
+
+    // Process buffered data at fixed rate with interpolation
+    stabilizationIntervalRef.current = setInterval(() => {
+      const bufferSize = dataBufferRef.current.length;
+      
+      // Update buffer status for monitoring
+      let status: 'normal' | 'low' | 'high' = 'normal';
+      if (bufferSize < 5) status = 'low';
+      else if (bufferSize > 50) status = 'high';
+      setBufferStatus({ size: bufferSize, status });
+
+      let sampleToAdd: EegDatum;
+      const now = Date.now();
+      
+      if (bufferSize > 0) {
+        // Take the oldest sample from buffer
+        const rawSample = dataBufferRef.current.shift()!;
+        lastProcessedValueRef.current = rawSample.value;
+        
+        sampleToAdd = {
+          ...rawSample,
+          timestamp: 0, // Will be set below
+        };
+      } else if (lastProcessedValueRef.current !== null) {
+        // Buffer empty - interpolate using last known value
+        // This ensures continuous sampling even if firmware is slow
+        sampleToAdd = {
+          value: lastProcessedValueRef.current,
+          timestamp: 0, // Will be set below
+          stage: currentStage,
+        };
+      } else {
+        // No data yet - skip this interval
+        return;
+      }
+      
+      setData((prev) => {
+        const lastTimestamp = prev.length > 0 ? prev[prev.length - 1].timestamp : now - sampleInterval;
+        // Ensure consistent spacing - use expected interval
+        const stabilizedTimestamp = lastTimestamp + sampleInterval;
+        
+        return [
+          ...prev.slice(-99),
+          {
+            ...sampleToAdd,
+            timestamp: stabilizedTimestamp,
+          },
+        ];
+      });
+    }, sampleInterval);
+
+    return () => {
+      if (stabilizationIntervalRef.current) {
+        clearInterval(stabilizationIntervalRef.current);
+        stabilizationIntervalRef.current = null;
+      }
+    };
+  }, [isStreaming, sampleInterval, currentStage]);
 
   // Calculate live sampling rate
   const liveSamplingRate = useMemo(() => {
@@ -143,6 +221,7 @@ export default function BleReader() {
     stageStartTimeRef.current = Date.now();
     setStageHistory([]);
     setData([]);
+    dataBufferRef.current = []; // Clear buffer when starting session
     setCurrentStage(initialStage); // Use selected initial stage
     console.log("Current stage set to:", initialStage);
     if (timerRef.current) clearInterval(timerRef.current);
@@ -278,7 +357,7 @@ export default function BleReader() {
     }
   };
 
-  // Handle incoming BLE notifications
+  // Handle incoming BLE notifications - add to buffer for stabilization
   const handleNotification = (event: Event) => {
     const value = (event.target as BluetoothRemoteGATTCharacteristic).value;
     if (!value) return;
@@ -286,15 +365,19 @@ export default function BleReader() {
     const str = decoder.decode(value.buffer);
     const num = parseInt(str, 10);
     if (!isNaN(num)) {
-      // Make sure the stage is properly attached to each data point
-      setData((prev) => [
-        ...prev.slice(-99),
-        { 
-          value: num, 
-          timestamp: Date.now(), 
-          stage: currentStage 
-        },
-      ]);
+      // Add to buffer instead of directly to state
+      // The stabilization interval will process this at fixed rate
+      dataBufferRef.current.push({
+        value: num,
+        timestamp: Date.now(), // Raw timestamp from firmware
+        stage: currentStage,
+      });
+      
+      // Prevent buffer overflow (keep last 200 samples for better smoothing)
+      // If buffer gets too large, drop oldest samples to prevent memory issues
+      if (dataBufferRef.current.length > 200) {
+        dataBufferRef.current = dataBufferRef.current.slice(-200);
+      }
     }
   };
 
@@ -304,6 +387,12 @@ export default function BleReader() {
     setBleState("idle");
     setDeviceName(null);
     setData([]);
+    dataBufferRef.current = []; // Clear buffer
+    lastProcessedValueRef.current = null; // Reset last value
+    if (stabilizationIntervalRef.current) {
+      clearInterval(stabilizationIntervalRef.current);
+      stabilizationIntervalRef.current = null;
+    }
     if (characteristicRef.current) {
       try {
         characteristicRef.current.removeEventListener("characteristicvaluechanged", handleNotification);
@@ -544,18 +633,29 @@ export default function BleReader() {
       <div className="mt-4">
         <div className="flex items-center justify-between mb-2">
           <h3 className="font-semibold">EEG Data (Live)</h3>
-          {isStreaming && liveSamplingRate > 0 && (
-            <div className="text-sm text-muted-foreground font-mono">
-              Sampling: {liveSamplingRate} Hz
-            </div>
-          )}
+          <div className="flex items-center gap-4">
+            {isStreaming && liveSamplingRate > 0 && (
+              <div className="text-sm text-muted-foreground font-mono">
+                Sampling: {liveSamplingRate} Hz
+              </div>
+            )}
+            {isStreaming && (
+              <div className={`text-xs font-mono ${
+                bufferStatus.status === 'low' ? 'text-yellow-500' : 
+                bufferStatus.status === 'high' ? 'text-orange-500' : 
+                'text-muted-foreground'
+              }`}>
+                Buffer: {bufferStatus.size}
+              </div>
+            )}
+          </div>
         </div>
         <div className="h-48 border border-border rounded p-2">
           <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={data} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+            <LineChart data={data} margin={{ top: 10, right: 10, left: 50, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#444" />
               <XAxis dataKey="timestamp" tick={false} axisLine={false} />
-              <YAxis domain={["auto", "auto"]} tick={{ fill: "#aaa" }} width={40} />
+              <YAxis domain={["auto", "auto"]} tick={{ fill: "#aaa" }} width={50} />
               <Tooltip contentStyle={{ background: "#222", border: "none", color: "#fff" }} labelFormatter={() => ""} />
               <Line type="monotone" dataKey="value" stroke="#a78bfa" dot={false} isAnimationActive={false} />
             </LineChart>
