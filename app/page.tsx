@@ -12,7 +12,7 @@ export default async function Home() {
         <div className="max-w-3xl mx-auto px-6 pt-6">
           <div className="text-right mb-4">
             <Link 
-              href="https://github.com/enkhbold470/eeg-study" 
+              href="https://github.com/enkhbold470/web-ble-monitor" 
               target="_blank" 
               rel="noopener noreferrer"
               className="text-xs text-muted-foreground hover:text-foreground transition-colors inline-flex items-center gap-1"
