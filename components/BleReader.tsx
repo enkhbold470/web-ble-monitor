@@ -82,6 +82,7 @@ export default function BleReader() {
   const [deviceName, setDeviceName] = useState<string | null>(null);
   const [participant, setParticipant] = useState("");
   const [participantSaved, setParticipantSaved] = useState(false);
+  const [sessionType, setSessionType] = useState<"baseline" | "focus">("baseline");
   const [data, setData] = useState<EegDatum[]>([]);
   const [sessionActive, setSessionActive] = useState(false);
   const [sessionEnded, setSessionEnded] = useState(false);
@@ -261,8 +262,9 @@ export default function BleReader() {
     
     try {
       const startedAt = sessionStartTimeRef.current || Date.now() - (SESSION_DURATION * 1000);
+      const participantNameWithType = participant ? `${participant}-${sessionType}` : `unknown-${sessionType}`;
       const jsonData = {
-        participantName: participant || "unknown",
+        participantName: participantNameWithType,
         startedAt,
         durationSeconds: SESSION_DURATION,
         totalSamples: data.length,
@@ -280,7 +282,7 @@ export default function BleReader() {
       // Create download link
       const link = document.createElement('a');
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const filename = `eeg-data-${participant || 'unknown'}-${timestamp}.json`;
+      const filename = `eeg-data-${participantNameWithType}-${timestamp}.json`;
       link.href = url;
       link.download = filename;
       document.body.appendChild(link);
@@ -306,17 +308,46 @@ export default function BleReader() {
         <span className={`inline-block w-2 h-2 rounded-full ml-2 ${bleState === "connected" ? "status-connected" : bleState === "error" ? "status-error" : "status-idle"}`}></span>
       </h2>
       {!participantSaved ? (
-        <form onSubmit={handleSaveParticipant} className="mb-4 flex gap-2">
-          <input
-            type="text"
-            placeholder="Enter participant name"
-            value={participant}
-            onChange={e => setParticipant(e.target.value)}
-            className="flex-1 px-3 py-2 rounded border border-input"
-            required
-          />
-          <Button type="submit" className="px-4 py-2 rounded transition">Save</Button>
-        </form>
+        <div className="mb-4 space-y-3">
+          <form onSubmit={handleSaveParticipant} className="flex gap-2">
+            <input
+              type="text"
+              placeholder="Enter participant name"
+              value={participant}
+              onChange={e => setParticipant(e.target.value)}
+              className="flex-1 px-3 py-2 rounded border border-input"
+              required
+            />
+            <Button type="submit" className="px-4 py-2 rounded transition">Save</Button>
+          </form>
+          <div className="flex gap-2">
+            <Button
+              onClick={() => setSessionType("baseline")}
+              className={`flex-1 px-4 py-2 rounded transition ${
+                sessionType === "baseline" 
+                  ? "bg-blue-600 text-white" 
+                  : "bg-gray-200 text-gray-700 hover:bg-gray-300"
+              }`}
+            >
+              Baseline
+            </Button>
+            <Button
+              onClick={() => setSessionType("focus")}
+              className={`flex-1 px-4 py-2 rounded transition ${
+                sessionType === "focus" 
+                  ? "bg-blue-600 text-white" 
+                  : "bg-gray-200 text-gray-700 hover:bg-gray-300"
+              }`}
+            >
+              Focus
+            </Button>
+          </div>
+          {participant && (
+            <div className="text-sm text-muted-foreground">
+              Participant: <span className="font-mono">{participant}-{sessionType}</span>
+            </div>
+          )}
+        </div>
       ) : null}
       {participantSaved && bleState === "idle" && !sessionActive && !sessionEnded && (
         <Button onClick={connect} className="mb-4 px-4 py-2 rounded transition">Connect to EEG Device</Button>
@@ -338,7 +369,7 @@ export default function BleReader() {
       {participantSaved && (
         <div className="mb-4 flex items-center gap-4">
           <span className="font-medium">Participant:</span>
-          <span className="font-mono">{participant}</span>
+          <span className="font-mono">{participant}-{sessionType}</span>
         </div>
       )}
       {bleState === "scanning" && <p>Scanning for device...</p>}
