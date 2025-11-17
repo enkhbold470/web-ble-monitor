@@ -7,7 +7,7 @@ import { processEegData, calculate5BandPSD, SAMPLING_RATE } from "@/lib/eegUtils
 const SERVICE_UUID = "0338ff7c-6251-4029-a5d5-24e4fa856c8d";
 const CHARACTERISTIC_UUID = "ad615f2b-cc93-4155-9e4d-f5f32cb9a2d7";
 
-const SESSION_DURATION = 10; // 30 seconds
+const SESSION_DURATION = 600; // 30 seconds
 
 type BleState = "idle" | "scanning" | "connecting" | "connected" | "error";
 
