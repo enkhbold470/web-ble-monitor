@@ -7,7 +7,7 @@ import { processEegData, calculate5BandPSD, SAMPLING_RATE } from "@/lib/eegUtils
 const SERVICE_UUID = "0338ff7c-6251-4029-a5d5-24e4fa856c8d";
 const CHARACTERISTIC_UUID = "ad615f2b-cc93-4155-9e4d-f5f32cb9a2d7";
 
-const SESSION_DURATION = 600; // 30 seconds
+const DEFAULT_SESSION_DURATION = 300; // 5 minutes default
 
 type BleState = "idle" | "scanning" | "connecting" | "connected" | "error";
 
@@ -83,10 +83,11 @@ export default function BleReader() {
   const [participant, setParticipant] = useState("");
   const [participantSaved, setParticipantSaved] = useState(false);
   const [sessionType, setSessionType] = useState<"baseline" | "focus">("baseline");
+  const [sessionDuration, setSessionDuration] = useState(DEFAULT_SESSION_DURATION);
   const [data, setData] = useState<EegDatum[]>([]);
   const [sessionActive, setSessionActive] = useState(false);
   const [sessionEnded, setSessionEnded] = useState(false);
-  const [timer, setTimer] = useState(SESSION_DURATION);
+  const [timer, setTimer] = useState(DEFAULT_SESSION_DURATION);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const sessionStartTimeRef = useRef<number | null>(null);
   const characteristicRef = useRef<BluetoothRemoteGATTCharacteristic | null>(null);
@@ -100,7 +101,7 @@ export default function BleReader() {
     console.log("Starting session - will collect data now");
     setSessionActive(true);
     setSessionEnded(false);
-    setTimer(SESSION_DURATION);
+    setTimer(sessionDuration);
     sessionStartTimeRef.current = Date.now();
     setData([]);
     console.log("Session active set to true, data cleared");
@@ -261,12 +262,12 @@ export default function BleReader() {
     setSaveError(null);
     
     try {
-      const startedAt = sessionStartTimeRef.current || Date.now() - (SESSION_DURATION * 1000);
+      const startedAt = sessionStartTimeRef.current || Date.now() - (sessionDuration * 1000);
       const participantNameWithType = participant ? `${participant}-${sessionType}` : `unknown-${sessionType}`;
       const jsonData = {
         participantName: participantNameWithType,
         startedAt,
-        durationSeconds: SESSION_DURATION,
+        durationSeconds: sessionDuration,
         totalSamples: data.length,
         eegData: data.map(d => ({
           value: d.value,
@@ -342,6 +343,26 @@ export default function BleReader() {
               Focus
             </Button>
           </div>
+          <div className="flex items-center gap-2">
+            <label className="text-sm font-medium whitespace-nowrap">Session Duration:</label>
+            <input
+              type="number"
+              min="10"
+              max="3600"
+              step="10"
+              value={sessionDuration}
+              onChange={e => {
+                const val = parseInt(e.target.value, 10);
+                if (!isNaN(val) && val >= 10) {
+                  setSessionDuration(val);
+                }
+              }}
+              className="flex-1 px-3 py-2 rounded border border-input"
+            />
+            <span className="text-sm text-muted-foreground whitespace-nowrap">
+              ({Math.floor(sessionDuration / 60)}m {sessionDuration % 60}s)
+            </span>
+          </div>
           {participant && (
             <div className="text-sm text-muted-foreground">
               Participant: <span className="font-mono">{participant}-{sessionType}</span>
@@ -367,9 +388,11 @@ export default function BleReader() {
         </div>
       )}
       {participantSaved && (
-        <div className="mb-4 flex items-center gap-4">
+        <div className="mb-4 flex items-center gap-4 flex-wrap">
           <span className="font-medium">Participant:</span>
           <span className="font-mono">{participant}-{sessionType}</span>
+          <span className="font-medium ml-4">Duration:</span>
+          <span className="font-mono">{Math.floor(sessionDuration / 60)}m {sessionDuration % 60}s</span>
         </div>
       )}
       {bleState === "scanning" && <p>Scanning for device...</p>}
