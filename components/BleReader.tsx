@@ -7,8 +7,6 @@ import { processEegData, calculate5BandPSD, SAMPLING_RATE } from "@/lib/eegUtils
 const SERVICE_UUID = "0338ff7c-6251-4029-a5d5-24e4fa856c8d";
 const CHARACTERISTIC_UUID = "ad615f2b-cc93-4155-9e4d-f5f32cb9a2d7";
 
-const DEFAULT_SESSION_DURATION = 300; // 5 minutes default
-
 type BleState = "idle" | "scanning" | "connecting" | "connected" | "error";
 
 interface EegDatum {
@@ -83,48 +81,36 @@ export default function BleReader() {
   const [participant, setParticipant] = useState("");
   const [participantSaved, setParticipantSaved] = useState(false);
   const [sessionType, setSessionType] = useState<"baseline" | "focus">("baseline");
-  const [sessionDuration, setSessionDuration] = useState(DEFAULT_SESSION_DURATION);
   const [data, setData] = useState<EegDatum[]>([]);
   const [sessionActive, setSessionActive] = useState(false);
   const [sessionEnded, setSessionEnded] = useState(false);
-  const [timer, setTimer] = useState(DEFAULT_SESSION_DURATION);
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
   const sessionStartTimeRef = useRef<number | null>(null);
+  const sessionEndTimeRef = useRef<number | null>(null);
   const characteristicRef = useRef<BluetoothRemoteGATTCharacteristic | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'success' | 'error'>("idle");
   const [saveError, setSaveError] = useState<string | null>(null);
 
 
-  // Start session timer
+  // Start session
   const startSession = () => {
     console.log("Starting session - will collect data now");
     setSessionActive(true);
     setSessionEnded(false);
-    setTimer(sessionDuration);
     sessionStartTimeRef.current = Date.now();
+    sessionEndTimeRef.current = null;
     setData([]);
+    setSaveStatus('idle');
+    setSaveError(null);
     console.log("Session active set to true, data cleared");
-    if (timerRef.current) clearInterval(timerRef.current);
-    timerRef.current = setInterval(() => {
-      setTimer((prev) => {
-        if (prev <= 1) {
-          endSession();
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
   };
 
-  // End session - automatically download JSON
-  const endSession = async () => {
+  // End session - manually stop and download JSON
+  const endSession = () => {
     console.log("Ending session, collected", data.length, "data points");
+    sessionEndTimeRef.current = Date.now();
     setSessionActive(false);
     setSessionEnded(true);
-    setIsStreaming(false);
-    setBleState("idle");
-    if (timerRef.current) clearInterval(timerRef.current);
     
     // Automatically download JSON if we have data
     if (data.length > 0) {
@@ -262,12 +248,15 @@ export default function BleReader() {
     setSaveError(null);
     
     try {
-      const startedAt = sessionStartTimeRef.current || Date.now() - (sessionDuration * 1000);
+      const startedAt = sessionStartTimeRef.current || Date.now();
+      const endedAt = sessionEndTimeRef.current || Date.now();
+      const actualDuration = Math.round((endedAt - startedAt) / 1000);
       const participantNameWithType = participant ? `${participant}-${sessionType}` : `unknown-${sessionType}`;
       const jsonData = {
         participantName: participantNameWithType,
         startedAt,
-        durationSeconds: sessionDuration,
+        endedAt,
+        durationSeconds: actualDuration,
         totalSamples: data.length,
         eegData: data.map(d => ({
           value: d.value,
@@ -343,26 +332,6 @@ export default function BleReader() {
               Focus
             </Button>
           </div>
-          <div className="flex items-center gap-2">
-            <label className="text-sm font-medium whitespace-nowrap">Session Duration:</label>
-            <input
-              type="number"
-              min="10"
-              max="3600"
-              step="10"
-              value={sessionDuration}
-              onChange={e => {
-                const val = parseInt(e.target.value, 10);
-                if (!isNaN(val) && val >= 10) {
-                  setSessionDuration(val);
-                }
-              }}
-              className="flex-1 px-3 py-2 rounded border border-input"
-            />
-            <span className="text-sm text-muted-foreground whitespace-nowrap">
-              ({Math.floor(sessionDuration / 60)}m {sessionDuration % 60}s)
-            </span>
-          </div>
           {participant && (
             <div className="text-sm text-muted-foreground">
               Participant: <span className="font-mono">{participant}-{sessionType}</span>
@@ -383,16 +352,22 @@ export default function BleReader() {
       )}
       {sessionActive && (
         <div className="mb-4 flex items-center gap-4">
-          <span className="font-medium">Time Left:</span>
-          <span className="text-lg font-mono">{Math.floor(timer/60).toString().padStart(2,'0')}:{(timer%60).toString().padStart(2,'0')}</span>
+          <span className="font-medium">Session Active</span>
+          <span className="text-sm text-muted-foreground">
+            ({sessionStartTimeRef.current ? Math.floor((Date.now() - sessionStartTimeRef.current) / 1000) : 0}s elapsed)
+          </span>
+          <Button
+            onClick={endSession}
+            className="ml-auto px-4 py-2 rounded bg-red-600 text-white hover:bg-red-700 transition"
+          >
+            Stop Session
+          </Button>
         </div>
       )}
       {participantSaved && (
-        <div className="mb-4 flex items-center gap-4 flex-wrap">
+        <div className="mb-4 flex items-center gap-4">
           <span className="font-medium">Participant:</span>
           <span className="font-mono">{participant}-{sessionType}</span>
-          <span className="font-medium ml-4">Duration:</span>
-          <span className="font-mono">{Math.floor(sessionDuration / 60)}m {sessionDuration % 60}s</span>
         </div>
       )}
       {bleState === "scanning" && <p>Scanning for device...</p>}
