@@ -5,6 +5,7 @@
 
 # next.js
 /.next/
+/.open-next/
 /out/
 
 # production
@@ -46,3 +47,5 @@ applications.json
 **/public/sw.js
 
 /lib/generated/prisma
+
+.wrangler/
