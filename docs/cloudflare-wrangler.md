@@ -17,6 +17,7 @@ This document describes the Cloudflare deployment setup added to this Next.js ap
 
 | Script        | Purpose |
 |---------------|---------|
+| `cf:build`    | Run **only** `opennextjs-cloudflare build` (use as Workers **Build command**). |
 | `cf:preview`  | Build with OpenNext and run in the Workers runtime locally. |
 | `cf:deploy`   | Build and deploy to Cloudflare. |
 | `cf:typegen`  | Generate `cloudflare-env.d.ts` from `wrangler.jsonc`. |
@@ -36,16 +37,60 @@ So: **`proxy.ts` is not a different product** — it is **middleware under a cle
 
 ---
 
-## Why this repo still uses `middleware.ts`
+## `proxy.ts` rules (CI / `next build`)
 
-**`@opennextjs/cloudflare` does not support Next.js 16’s Node-based `proxy.ts` bundle path yet** and fails the OpenNext build if only `proxy.ts` is used. It still expects the **legacy Edge `middleware.ts`** export for that layer.
+If the project has a root **`proxy.ts`** file, Next.js 16 requires **either**:
 
-- You **cannot** have both `middleware.ts` and `proxy.ts` in the same project; Next.js errors.
-- Until the adapter supports `proxy` end-to-end, this project keeps **`middleware.ts`** so **`bun run cf:preview` / `cf:deploy`** keep working.
+- a **named** export: `export function proxy(request: NextRequest) { ... }`, or  
+- a **default** export that is that function.
 
-Upstream context: [opennextjs-cloudflare#1082](https://github.com/opennextjs/opennextjs-cloudflare/issues/1082).
+Exporting **`middleware`** from **`proxy.ts`** is invalid and fails **`next build`** with:
 
-When support lands, the intended end state is: **one root file `proxy.ts`** exporting **`proxy`**, with the same logic you have today in `middleware.ts`.
+> The file "./proxy.ts" must export a function … named "proxy" export.
+
+**`proxy.ts` and `middleware.ts` cannot both exist**; Next.js errors if both are present.
+
+---
+
+## Standard `next build` vs OpenNext (`cf:deploy`)
+
+| Command | Root file | Export |
+|--------|-----------|--------|
+| `next build` (Vercel, Cloudflare Workers Builds using `pnpm run build`, etc.) | `proxy.ts` | `export function proxy` |
+| `opennextjs-cloudflare build` (`cf:preview` / `cf:deploy`) | **`middleware.ts` only** (no `proxy.ts` in repo) | `export function middleware` |
+
+**`@opennextjs/cloudflare` still treats Next 16 `proxy.ts` as Node middleware** and fails with “Node.js middleware is not currently supported”. You **cannot** satisfy **both** pipelines with one root file until the adapter supports `proxy` ([opennextjs-cloudflare#1082](https://github.com/opennextjs/opennextjs-cloudflare/issues/1082)).
+
+**Practical options:**
+
+1. **Default (CI):** Keep **`proxy.ts`** + **`export function proxy`** so **`pnpm run build` succeeds.  
+2. **When you need `cf:deploy`:** Use **`middleware.ts`** only (same logic, **`export function middleware`**), **remove `proxy.ts`**, run OpenNext; or wait for adapter support for `proxy.ts`.
+
+---
+
+## Workers Builds: "Could not find compiled Open Next config"
+
+Cloudflare detected an OpenNext project and ran **`opennextjs-cloudflare deploy`** in the deploy step. That command **does not** run `next build` for you; it expects the **OpenNext build** to have **already** run and written **`.open-next/`** (worker bundle, assets, compiled config).
+
+What often goes wrong:
+
+1. **Build command** in the dashboard is still **`pnpm run build`** / **`npm run build`**, which only runs **`next build`**. That produces **`.next/`**, not the **`.open-next/`** tree OpenNext needs.
+2. The **deploy** step then calls **`opennextjs-cloudflare deploy`**, finds no compiled OpenNext output, and exits with **"Could not find compiled Open Next config, did you run the build command?"**
+
+**Fix (Cloudflare dashboard → Workers → your Worker → Settings → Builds):**
+
+- Set **Build command** to one of:
+  - `pnpm exec opennextjs-cloudflare build`
+  - `pnpm run cf:build` (if you use `pnpm` and this repo’s scripts)
+  - `bunx opennextjs-cloudflare build` / `bun run cf:build` when using Bun locally; on Workers Builds use the same package manager the project uses (`pnpm exec …`, `npx …`, etc.).
+- Keep **Deploy** as automatic (or **`opennextjs-cloudflare deploy`** / **`wrangler deploy`**) **after** that build succeeds.
+
+**Do not** rely on **`pnpm run build`** alone for Cloudflare OpenNext deploy. Either:
+
+- use **`cf:build`** (OpenNext) as the **Build command**, or  
+- use a **single** custom command that does both, e.g. `pnpm exec opennextjs-cloudflare build && pnpm exec opennextjs-cloudflare deploy`, and align the dashboard so it doesn’t run a redundant `next-only` build before deploy.
+
+**Note:** `opennextjs-cloudflare build` runs your **`package.json`** **`build`** script (`next build --webpack`) internally, then generates **`.open-next/`**. You still hit the **`proxy.ts` vs `middleware.ts`** limitation for OpenNext until the adapter supports Node proxy ([#1082](https://github.com/opennextjs/opennextjs-cloudflare/issues/1082)).
 
 ---
 

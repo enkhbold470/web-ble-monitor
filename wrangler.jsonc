@@ -1,3 +1,7 @@
+// Workers Builds: set dashboard "Build command" to OpenNext, e.g.
+//   pnpm exec opennextjs-cloudflare build
+// NOT plain `pnpm run build` (that only runs next build and skips .open-next/).
+// See docs/cloudflare-wrangler.md — "Could not find compiled Open Next config".
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "web-ble-monitor",
