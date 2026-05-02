@@ -2,10 +2,13 @@ import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 
 /**
- * Next.js 16 request proxy (same role as deprecated middleware.ts).
- * Export must be named `proxy` when using this file name.
+ * Root interceptor for OpenNext (@opennextjs/cloudflare): emits Edge middleware in the Next
+ * manifest, which passes OpenNext's build check. **`proxy.ts` + Node proxy** breaks `cf:*`
+ * today — see docs/cloudflare-wrangler.md and opennextjs-cloudflare#1082.
+ *
+ * Next 16 deprecation warning (“use proxy instead”) is expected until upstream supports Proxy.
  */
-export function proxy(request: NextRequest) {
+export function middleware(request: NextRequest) {
   if (request.nextUrl.pathname.startsWith("/admin")) {
     const host = request.headers.get("host") || "";
     const isAllowedHost =

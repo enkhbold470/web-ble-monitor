@@ -1,0 +1,21 @@
+{
+  "name": "web-ble-monitor-mcp-worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "setup": "workers-mcp setup",
+    "deploy": "workers-mcp docgen src/index.ts && wrangler deploy --config ./wrangler.toml",
+    "dev": "wrangler dev --config ./wrangler.toml",
+    "cf-typegen": "wrangler types --config ./wrangler.toml",
+    "docgen": "workers-mcp docgen src/index.ts"
+  },
+  "dependencies": {
+    "workers-mcp": "^0.0.13"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250525.0",
+    "typescript": "^5",
+    "wrangler": "^4.87.0"
+  }
+}
