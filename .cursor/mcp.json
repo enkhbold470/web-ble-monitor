@@ -1,0 +1,29 @@
+{
+  "mcpServers": {
+    "workers-mcp": {
+      "command": "${workspaceFolder}/workers-mcp/node_modules/.bin/workers-mcp",
+      "args": [
+        "run",
+        "web-ble-monitor-mcp",
+        "${env:CF_WORKERS_MCP_URL}",
+        "${workspaceFolder}/workers-mcp"
+      ]
+    },
+    "cloudflare-workers-builds": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote@latest",
+        "https://builds.mcp.cloudflare.com/mcp"
+      ]
+    },
+    "cloudflare-workers-observability": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote@latest",
+        "https://observability.mcp.cloudflare.com/mcp"
+      ]
+    }
+  }
+}
