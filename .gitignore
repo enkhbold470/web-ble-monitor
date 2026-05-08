@@ -49,3 +49,4 @@ applications.json
 /lib/generated/prisma
 
 .wrangler/
+/dist/
