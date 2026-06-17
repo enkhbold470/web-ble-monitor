@@ -1,16 +1,16 @@
 'use client';
 
-import { useState, useEffect, useTransition } from 'react';
+import { useState, useTransition } from 'react';
 import { authenticateAdmin, logout } from '@/app/actions/config';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
 import { useToast } from '@/hooks/use-toast';
-import Link from 'next/link';
-import Image from 'next/image';
+import { Shield } from 'lucide-react';
 import { useRouter } from 'next/navigation';
-interface AuthWrapperProps {  
+
+interface AuthWrapperProps {
   children: React.ReactNode;
   isAuthenticated: boolean;
 }
@@ -18,47 +18,33 @@ interface AuthWrapperProps {
 export default function AuthWrapper({ children, isAuthenticated }: AuthWrapperProps) {
   const [isPending, startTransition] = useTransition();
   const [error, setError] = useState<string>('');
-  const [isLocalhost, setIsLocalhost] = useState(false);
   const { toast } = useToast();
   const router = useRouter();
-  useEffect(() => {
-    // Check if we're on localhost
-    const checkHost = () => {
-      const host = window.location.host;
-        const localhost = host.startsWith('localhost:') || host.startsWith('127.0.0.1:') || host.startsWith('nf-next-ble.vercel.app');
-      setIsLocalhost(localhost);
-      
-      if (!localhost) {
-          setError('Admin panel is only accessible from localhost');
-      }
-    };
-
-    checkHost();
-  }, []);
 
   const handleLogin = async (formData: FormData) => {
     setError('');
     startTransition(async () => {
       try {
-        const result: any = await authenticateAdmin(formData);
-        if (result && result.success) {
+        const result = await authenticateAdmin(formData);
+        if (result?.success) {
           toast({
-            title: "Admin Page",
-            description: "Login successful",
+            title: 'Signed in',
+            description: 'Login successful',
           });
-          router.push('/');
+          router.refresh();
         } else {
           setError('Invalid credentials');
-          toast({
-            title: "Admin Page",
-            description: "Login failed",
-          });
         }
       } catch (err) {
-        setError('Invalid credentials');
+        const message =
+          err instanceof Error && err.message.includes('Too many login')
+            ? 'Too many login attempts. Try again later.'
+            : 'Invalid credentials';
+        setError(message);
         toast({
-          title: "Admin Page",
-          description: "Login failed",
+          title: 'Login failed',
+          description: message,
+          variant: 'destructive',
         });
       }
     });
@@ -68,25 +54,25 @@ export default function AuthWrapper({ children, isAuthenticated }: AuthWrapperPr
     startTransition(async () => {
       await logout();
       toast({
-        title: "Admin Page",
-        description: "Logout successful",
+        title: 'Signed out',
+        description: 'Logout successful',
       });
-      router.push('/');
+      router.refresh();
     });
   };
 
   if (!isAuthenticated) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center">
+      <div className="min-h-screen flex flex-col items-center justify-center px-4">
         <Card className="w-full max-w-md border-border">
           <CardHeader>
             <div className="flex items-center gap-2">
-              <Image src="https://placekeanu.com/100/100" alt="NF Logo" width={100} height={100} className="rounded-full" />
-              <CardTitle>Admin Login</CardTitle>
+              <Shield className="h-10 w-10 text-primary" aria-hidden />
+              <CardTitle>Sign in</CardTitle>
             </div>
           </CardHeader>
           <CardContent>
-            <form action={handleLogin} className="space-y-4">
+            <form action={handleLogin} className="space-y-4" autoComplete="off">
               <div className="space-y-2">
                 <Label htmlFor="username">Username</Label>
                 <Input
@@ -95,6 +81,7 @@ export default function AuthWrapper({ children, isAuthenticated }: AuthWrapperPr
                   type="text"
                   required
                   disabled={isPending}
+                  autoComplete="username"
                 />
               </div>
               <div className="space-y-2">
@@ -105,25 +92,24 @@ export default function AuthWrapper({ children, isAuthenticated }: AuthWrapperPr
                   type="password"
                   required
                   disabled={isPending}
+                  autoComplete="current-password"
                 />
               </div>
               {error && (
-                <div className="text-sm">{error}</div>
+                <div className="text-sm text-destructive" role="alert">
+                  {error}
+                </div>
               )}
-              <Button 
-                type="submit" 
-                className="w-full" 
+              <Button
+                type="submit"
+                className="w-full"
                 disabled={isPending}
               >
-                {isPending ? 'Login...' : 'Login'}
+                {isPending ? 'Signing in...' : 'Sign in'}
               </Button>
             </form>
           </CardContent>
         </Card>
-
-        <div className="text-center text-sm mt-4">
-          Create new admin account: <Link href="mailto:inky@enk.icu" className="hover:underline">inky@enk.icu</Link>
-        </div>
       </div>
     );
   }
@@ -135,9 +121,9 @@ export default function AuthWrapper({ children, isAuthenticated }: AuthWrapperPr
         disabled={isPending}
         className="absolute top-4 right-4 px-4 py-2 rounded"
       >
-        {isPending ? 'Logout...' : 'Logout'}
+        {isPending ? 'Signing out...' : 'Sign out'}
       </Button>
       {children}
     </div>
   );
-} 
+}

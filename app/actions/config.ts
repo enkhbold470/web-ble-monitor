@@ -1,92 +1,72 @@
-// app/actions/config.ts
-"use server"
+"use server";
 
-import { cookies } from 'next/headers'
+import {
+  checkLoginRateLimit,
+  clearLoginRateLimit,
+  verifyAdminCredentials,
+} from "@/lib/auth-credentials";
+import {
+  clearSessionCookie,
+  isAuthenticatedSession,
+  setSessionCookie,
+} from "@/lib/auth-session";
+import { headers } from "next/headers";
 
-// Custom error class for better error handling
 class AdminActionError extends Error {
-  constructor(message: string, public code?: string) {
-    super(message)
-    this.name = 'AdminActionError'
+  constructor(
+    message: string,
+    public code?: string,
+  ) {
+    super(message);
+    this.name = "AdminActionError";
   }
 }
 
-// Error handler wrapper
-async function withErrorHandling<T>(operation: () => Promise<T>, operationName: string): Promise<T> {
-  try {
-    return await operation()
-  } catch (error) {
-    console.error(`❌ [${operationName}] Error:`, error)
-    
-    // Handle different types of errors
-    if (error instanceof AdminActionError) {
-      throw error
-    }
-    
-    // Network or other errors
-    if (error instanceof Error) {
-      throw new AdminActionError(`Систем алдаа: ${error.message}`, 'SYSTEM_ERROR')
-    }
-    
-    // Unknown errors
-    throw new AdminActionError('Тодорхойгүй алдаа гарлаа', 'UNKNOWN_ERROR')
+async function getRequestIp(): Promise<string> {
+  const headerStore = await headers();
+  const forwardedFor = headerStore.get("x-forwarded-for");
+  if (forwardedFor) {
+    return forwardedFor.split(",")[0]?.trim() || "unknown";
   }
+
+  return (
+    headerStore.get("cf-connecting-ip") ||
+    headerStore.get("x-real-ip") ||
+    "unknown"
+  );
 }
 
-// Simple authentication
 export async function authenticateAdmin(formData: FormData) {
-  return withErrorHandling(async () => {
-    const username = formData.get('username') as string
-    const password = formData.get('password') as string
-    
-    const adminPassword = process.env.ADMIN_PASSWORD || 'admin123' // fallback for development
-    if (username === 'admin' && password === adminPassword) {
-      const cookieStore = await cookies()
-      cookieStore.set('admin-auth', 'authenticated', {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        maxAge: 60 * 60 * 24 // 24 hours
-      })
-      return { success: true }
-    } else {
-      throw new AdminActionError('Буруу нэвтрэх мэдээлэл', 'INVALID_CREDENTIALS')
-    }
-  }, 'authenticateAdmin')
+  const ip = await getRequestIp();
+  const rateLimit = checkLoginRateLimit(ip);
+  if (!rateLimit.allowed) {
+    throw new AdminActionError(
+      "Too many login attempts. Try again later.",
+      "RATE_LIMITED",
+    );
+  }
+
+  const username = formData.get("username");
+  const password = formData.get("password");
+
+  if (typeof username !== "string" || typeof password !== "string") {
+    throw new AdminActionError("Invalid credentials", "INVALID_CREDENTIALS");
+  }
+
+  if (!verifyAdminCredentials(username, password)) {
+    throw new AdminActionError("Invalid credentials", "INVALID_CREDENTIALS");
+  }
+
+  clearLoginRateLimit(ip);
+  await setSessionCookie();
+  return { success: true };
 }
 
 export async function logout() {
-  return withErrorHandling(async () => {
-    const cookieStore = await cookies()
-    cookieStore.delete('admin-auth')
-    // Do not call redirect here; handle redirect on client
-    return { success: true }
-  }, 'logout')
+  await clearSessionCookie();
+  return { success: true };
 }
 
 export async function isAuthenticated() {
-  return withErrorHandling(async () => {
-    const cookieStore = await cookies()
-    const authCookie = cookieStore.get('admin-auth')
-    return authCookie?.value === 'authenticated'
-  }, 'isAuthenticated')
+  return isAuthenticatedSession();
 }
-
-// Site Config Actions - using static config only
-export async function getSiteConfig() {
-  return withErrorHandling(async () => {
-    const { siteConfig } = await import('@/config/site')
-    return siteConfig;
-  }, 'getSiteConfig')
-}
-
-export async function updateSiteConfig(data: any) {
-  return withErrorHandling(async () => {
-    if (!data.name || !data.description) {
-      throw new AdminActionError('Нэр болон тайлбар заавал шаардлагатай', 'VALIDATION_ERROR')
-    }
-    // Site config is now static only - no database updates
-    throw new AdminActionError('Site config is read-only', 'READ_ONLY')
-  }, 'updateSiteConfig')
-}
-
-  
