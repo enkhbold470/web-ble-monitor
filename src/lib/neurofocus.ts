@@ -500,23 +500,62 @@ export class NeuroFocus {
 			this.msg('Web Serial not available — use Chrome / Edge on desktop.');
 			return;
 		}
+		let port: Ble;
 		try {
-			this.msg('select the MindWave serial port…');
-			const port: Ble = await nav.serial.requestPort();
-			await port.open({ baudRate: this.NS_BAUD });
-			this.nsPort = port;
-			this.nsAbort = false;
-			this.stopDemo();
-			this.reset();
-			this.setFs(512);
-			this.unit = 'uV';
-			this.setMode('live · neurosky', '#5fe886');
-			this.msg('NeuroSky MindWave linked — streaming raw EEG @ 512 Hz');
-			void this.readMindWave();
-		} catch (e) {
-			const m = e instanceof Error ? e.message : String(e);
-			// requestPort throws "No port selected" when the user cancels the chooser.
-			this.msg(/No port selected/i.test(m) ? 'NeuroSky: no port selected' : 'NeuroSky: ' + m);
+			this.msg('select the MindWave serial port (MindWaveMobile)…');
+			port = await nav.serial.requestPort();
+		} catch {
+			this.msg('NeuroSky: no port selected');
+			return;
+		}
+		// Opening a paired Bluetooth-serial port only works while the headset is
+		// actively connected. The first open() often just wakes the RFCOMM link,
+		// so retry a few times before giving up.
+		const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+		let lastErr: unknown = null;
+		for (let attempt = 1; attempt <= 4; attempt++) {
+			try {
+				await port.open({ baudRate: this.NS_BAUD });
+				lastErr = null;
+				break;
+			} catch (e) {
+				lastErr = e;
+				this.msg(`opening MindWave… waking Bluetooth link (try ${attempt}/4)`);
+				await sleep(800);
+			}
+		}
+		if (lastErr) {
+			this.neuroSkyOpenFailed(lastErr);
+			return;
+		}
+		this.nsPort = port;
+		this.nsAbort = false;
+		this.stopDemo();
+		this.reset();
+		this.setFs(512);
+		this.unit = 'uV';
+		const banner = this.el('nf-banner');
+		if (banner) banner.style.display = 'none';
+		this.setMode('live · neurosky', '#5fe886');
+		this.msg('NeuroSky MindWave linked — streaming raw EEG @ 512 Hz');
+		void this.readMindWave();
+	}
+
+	private neuroSkyOpenFailed(e: unknown): void {
+		const m = e instanceof Error ? e.message : String(e);
+		this.setMode('idle', '#2a3329');
+		this.msg('NeuroSky: ' + m);
+		const b = this.el('nf-banner');
+		if (b) {
+			b.style.display = 'block';
+			// The port exists (paired) but couldn't be opened — the headset isn't
+			// actively connected. Give the exact steps rather than the raw error.
+			b.innerHTML =
+				'⚠ Couldn’t open the MindWave port — it’s <b>paired but not connected</b>. ' +
+				'1) Turn the headset ON and wear it. ' +
+				'2) In macOS  Bluetooth settings it must show <b>“Connected”</b> with a <b>solid</b> blue LED (not blinking) — click Connect if it doesn’t. ' +
+				'3) Quit any other app using it (ThinkGear, the phone app). ' +
+				'4) Click NeuroSky again. If two “MindWaveMobile” entries appear, try the other one.';
 		}
 	}
 
