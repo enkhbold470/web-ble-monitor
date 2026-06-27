@@ -51,6 +51,12 @@ export class NeuroFocus {
 	private ovf = 0;
 	private lastPsd = 0;
 	private welchN = 1024;
+	// Welch averaging: a longer history + high overlap gives many averaged segments, which
+	// is what makes the PSD smooth and pins the alpha peak at its true ~10 Hz. The old
+	// 4 s / 0.5-overlap window yielded only ~3 segments -> jagged spectrum and the peak
+	// jittering up to ~12 Hz. 10 s @ 0.75 overlap -> ~20 segments.
+	private psdWindowS = 10;
+	private welchOverlap = 0.75;
 	private chain: FilterChain | null = null;
 
 	private raf = 0;
@@ -107,7 +113,9 @@ export class NeuroFocus {
 
 	private setFs(fs: number): void {
 		this.fs = fs;
-		this.filtCap = Math.round(fs * 6);
+		// Hold enough filtered history for the Welch window (+ headroom) so the PSD can
+		// average many segments instead of the ~3 a 4 s buffer allowed.
+		this.filtCap = Math.round(fs * (this.psdWindowS + 2));
 		this.hop = Math.round(fs * 0.18);
 		this.chain = dsp.makeChain(fs, { lo: 1, hi: 45, line: this.settings.line });
 		this.welchN = dsp.nextPow2(Math.min(Math.round(fs * 2), 1024));
@@ -181,8 +189,8 @@ export class NeuroFocus {
 			}
 			if (now - this.lastPsd > 450 && this.filt.length > this.welchN) {
 				this.lastPsd = now;
-				const seg = this.filt.slice(-Math.min(this.filt.length, Math.round(this.fs * 4)));
-				this.psd = dsp.welch(Float64Array.from(seg), this.fs, this.welchN, 0.5);
+				const seg = this.filt.slice(-Math.min(this.filt.length, Math.round(this.fs * this.psdWindowS)));
+				this.psd = dsp.welch(Float64Array.from(seg), this.fs, this.welchN, this.welchOverlap);
 				this.drawPsd();
 				this.drawBands();
 				const pk = dsp.peakFreq(this.psd.freqs, this.psd.psd, 7, 13);
@@ -688,9 +696,9 @@ export class NeuroFocus {
 			return;
 		}
 		const seg = Float64Array.from(
-			this.filt.slice(-Math.min(this.filt.length, Math.round(this.fs * 4)))
+			this.filt.slice(-Math.min(this.filt.length, Math.round(this.fs * this.psdWindowS)))
 		);
-		const { freqs, psd } = dsp.welch(seg, this.fs, this.welchN, 0.5);
+		const { freqs, psd } = dsp.welch(seg, this.fs, this.welchN, this.welchOverlap);
 		this.cmp[which] = { freqs, psd, alpha: dsp.bandPowers(freqs, psd).alpha };
 		this.msg('captured eyes-' + which + ' spectrum');
 		this.drawCmp();
