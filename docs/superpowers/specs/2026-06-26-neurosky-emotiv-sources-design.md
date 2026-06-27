@@ -12,13 +12,13 @@ test working with every source.
 ## Connectivity reality (why each source differs)
 
 - **Custom firmware (existing):** Web Bluetooth / GATT, ASCII-integer frames. Unchanged.
-- **NeuroSky MindWave Mobile 2:** **BLE GATT** (Web Bluetooth). UUIDs confirmed
-  on-device by the NF-ios project: service `039afff0-2c94-11e3-9e06-0002a5d5c51b`,
-  ThinkGear notify char `039afff4-…`, command char `039affa0-…` (write `0x02`).
-  Parse the **ThinkGear (TGAM)** binary stream; raw 512 Hz EEG, scale 0.51 µV/unit.
-  Caveat (NF-ios): reliable raw on MWM2 needed NeuroSky's SDK handshake — pure
-  GATT may connect and give eSense but not guaranteed raw. (Classic MindWave 1 /
-  USB dongle is Bluetooth Classic / serial — not implemented.)
+- **NeuroSky MindWave Mobile 2:** **local bridge → WebSocket** (`bridge/neurosky-bridge.ts`).
+  A browser cannot get MWM2 raw directly — the raw enable handshake is inside
+  NeuroSky's compiled SDK, `0x02`-over-GATT is empirically insufficient (proven
+  in NF-ios), and modern macOS exposes no serial port for SPP. The bridge connects
+  to NeuroSky's free **ThinkGear Connector** (TCP `127.0.0.1:13854`,
+  `enableRawOutput:true`) and re-serves raw as `ws://localhost:8127`. `--mock`
+  streams synthetic alpha for dev/test. Raw 512 Hz, scale 0.51 µV/unit.
 - **Emotiv (EPOC/Insight):** raw EEG is AES-encrypted; only obtainable via the
   paid **Cortex API** (local WebSocket). Out of scope for now → "coming soon" stub.
 
@@ -38,11 +38,14 @@ Streaming ThinkGear/TGAM packet parser. Stateful across byte chunks.
 - Invalid checksums / partial packets are buffered, not thrown.
 
 ### 2. `neurofocus.ts` — adapter methods
-- `connectNeuroSky()`: Web Bluetooth → `requestDevice` (NS service / MindWave name)
-  → subscribe to the F4 notify char → write `0x02` to the A0 command char →
-  `characteristicvaluechanged` feeds bytes to `ThinkGearParser` → raw samples via
-  `ingest()` at `fs = 512`, scaled 0.51 µV/unit. Reuses the existing
-  `dev`/`dataChar`/`cmdChar` fields + `reset()` / `setFs()` / `setMode('live · mindwave', …)`.
+- `connectNeuroSky()`: opens `ws://localhost:8127` (the bridge). `onmessage`
+  parses `{raw:number[], poorSignal?}` and feeds raw via `ingest()` at `fs = 512`,
+  scaled 0.51 µV/unit. `reset()`/`setFs()`/`setMode('live · neurosky', …)` on open;
+  socket closed in `stopAll()`. Clear error if the bridge isn't running.
+
+### 2b. `bridge/neurosky-bridge.ts` (new, Bun)
+TCP client to ThinkGear Connector (`enableRawOutput:true`) → WebSocket server on
+8127. `--mock` streams synthetic 10 Hz alpha at 512 Hz. Batches raw every 50 ms.
 - `connectEmotiv()`: status-line stub — "Emotiv (Cortex API) — coming soon".
 - `stopAll()`: also cancels the serial reader and closes the port.
 - Capability guard: missing `navigator.serial` → banner message (mirrors the

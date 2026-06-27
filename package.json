@@ -5,6 +5,8 @@
 	"type": "module",
 	"scripts": {
 		"dev": "vite dev",
+		"bridge": "bun bridge/neurosky-bridge.ts",
+		"bridge:mock": "bun bridge/neurosky-bridge.ts --mock",
 		"build": "vite build",
 		"cf:build": "vite build",
 		"cf:deploy": "wrangler deploy",
