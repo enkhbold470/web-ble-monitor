@@ -54,15 +54,18 @@ export class NeuroFocus {
 	private dev: Ble = null;
 	private dataChar: Ble = null;
 	private cmdChar: Ble = null;
+	private tgParser: ThinkGearParser | null = null;
 
-	// Web Serial (NeuroSky ThinkGear)
-	private port: Ble = null;
-	private reader: Ble = null;
-	private serialAbort = false;
+	// NeuroSky MindWave Mobile 2 BLE GATT (UUIDs confirmed on-device by NF-ios):
+	// ThinkGear stream on the F4 notify char; F0 service; A0 command (write 0x02
+	// to enable the raw + normal output mode). Lowercase for Web Bluetooth.
+	private readonly NS_SERVICE = '039afff0-2c94-11e3-9e06-0002a5d5c51b';
+	private readonly NS_DATA = '039afff4-2c94-11e3-9e06-0002a5d5c51b';
+	private readonly NS_CMD = '039affa0-2c94-11e3-9e06-0002a5d5c51b';
 
-	// NeuroSky raw count -> approximate µV: (1.8V / 4096) / gain(2000), in µV.
+	// NeuroSky raw ThinkGear unit -> µV (~0.51 µV/unit; the value NF-ios uses).
 	// Uncalibrated, but the eyes-open/closed alpha ratio is relative so unaffected.
-	private readonly NEUROSKY_UV = (1.8e6 / 4096) / 2000;
+	private readonly NEUROSKY_UV = 0.51;
 
 	// ---------- lifecycle ----------
 	mount(): void {
@@ -464,61 +467,63 @@ export class NeuroFocus {
 		this.ingestMany(vals, false);
 	}
 
-	// ---------- NeuroSky MindWave (Web Serial / ThinkGear) ----------
+	// ---------- NeuroSky MindWave Mobile 2 (BLE GATT / ThinkGear) ----------
+	// Mirrors the NF-ios CoreBluetooth path: subscribe to the F4 notify char,
+	// write 0x02 to the A0 command char to enable streaming, parse ThinkGear.
+	// Caveat (per NF-ios): on MWM2 the 0x02 enable alone is sometimes not enough
+	// for raw — reliable raw needs NeuroSky's SDK handshake, which a browser
+	// can't run. We may still get eSense (signal/attention) even without raw.
 	async connectNeuroSky(): Promise<void> {
-		const nav = navigator as Navigator & { serial?: Ble };
-		if (!nav.serial) {
-			const b = this.el('nf-banner');
-			if (b) {
-				b.style.display = 'block';
-				b.textContent =
-					'⚠ Web Serial unavailable — NeuroSky needs Chrome / Edge on desktop. Pair the MindWave in your OS Bluetooth settings first so it appears as a serial port.';
-			}
-			this.msg('Web Serial not available — use Chrome / Edge desktop.');
+		const nav = navigator as Navigator & { bluetooth?: Ble };
+		if (!nav.bluetooth) {
+			this.msg('Web Bluetooth not available — open BERGER-1 standalone in Chrome / Edge.');
 			return;
 		}
 		try {
-			this.msg('select the MindWave serial port…');
-			const port: Ble = await nav.serial.requestPort();
-			await port.open({ baudRate: 57600 });
-			this.port = port;
-			this.serialAbort = false;
+			this.msg('requesting MindWave…');
+			const dev: Ble = await nav.bluetooth.requestDevice({
+				filters: [{ services: [this.NS_SERVICE] }, { namePrefix: 'MindWave' }, { namePrefix: 'NeuroSky' }],
+				optionalServices: [this.NS_SERVICE]
+			});
+			this.dev = dev;
+			dev.addEventListener('gattserverdisconnected', () => {
+				this.setMode('idle', '#2a3329');
+				this.msg('MindWave disconnected');
+			});
+			const server: Ble = await dev.gatt.connect();
+			const svc: Ble = await server.getPrimaryService(this.NS_SERVICE);
+			this.dataChar = await svc.getCharacteristic(this.NS_DATA);
+			this.cmdChar = await svc.getCharacteristic(this.NS_CMD);
 			this.stopDemo();
 			this.reset();
 			this.setFs(512);
 			this.unit = 'uV';
-			this.setMode('live · neurosky', '#5fe886');
-			this.msg('linked to NeuroSky MindWave — streaming 512 Hz');
-			void this.readSerial();
+			this.tgParser = new ThinkGearParser();
+			await this.dataChar.startNotifications();
+			this.dataChar.addEventListener('characteristicvaluechanged', (e: Event) => this.onThinkGear(e));
+			// Enable raw + normal output (0x02). Best-effort; ignore write errors.
+			try {
+				await this.cmdChar.writeValue(new Uint8Array([0x02]));
+			} catch {
+				/* some MWM2 firmwares reject the write but still stream once subscribed */
+			}
+			this.setMode('live · mindwave', '#5fe886');
+			this.msg('linked to ' + (dev.name || 'MindWave') + ' — 512 Hz ThinkGear');
 		} catch (e) {
 			this.msg('NeuroSky: ' + (e instanceof Error ? e.message : String(e)));
 		}
 	}
 
-	private async readSerial(): Promise<void> {
-		const parser = new ThinkGearParser();
-		try {
-			while (this.port && this.port.readable && !this.serialAbort) {
-				this.reader = this.port.readable.getReader();
-				try {
-					for (;;) {
-						const { value, done } = await this.reader.read();
-						if (done || this.serialAbort) break;
-						if (!value) continue;
-						const r = parser.push(value as Uint8Array);
-						for (const s of r.raw) this.ingest(s * this.NEUROSKY_UV, true);
-						if (r.poorSignal !== undefined) {
-							this.setText('nf-ovf', String(r.poorSignal));
-							if (r.poorSignal >= 200) this.msg('NeuroSky: no contact — adjust the headset');
-						}
-					}
-				} finally {
-					this.reader.releaseLock();
-					this.reader = null;
-				}
-			}
-		} catch (e) {
-			if (!this.serialAbort) this.msg('NeuroSky stream error: ' + (e instanceof Error ? e.message : String(e)));
+	private onThinkGear(e: Event): void {
+		const target = e.target as { value?: DataView };
+		if (!target.value || !this.tgParser) return;
+		const bytes = new Uint8Array(target.value.buffer, target.value.byteOffset, target.value.byteLength);
+		const r = this.tgParser.push(bytes);
+		if (!r.raw.length) this.ovf++;
+		for (const s of r.raw) this.ingest(s * this.NEUROSKY_UV, true);
+		if (r.poorSignal !== undefined) {
+			if (r.poorSignal >= 200) this.msg('MindWave: no contact — adjust the headset');
+			else if (r.poorSignal > 0) this.msg('MindWave: signal noisy (' + r.poorSignal + ')');
 		}
 	}
 
@@ -579,7 +584,6 @@ export class NeuroFocus {
 
 	async stopAll(): Promise<void> {
 		this.stopDemo();
-		this.serialAbort = true;
 		try {
 			if (this.cmdChar) await this.cmdChar.writeValue(new TextEncoder().encode('s'));
 			if (this.dataChar) await this.dataChar.stopNotifications();
@@ -587,14 +591,8 @@ export class NeuroFocus {
 		} catch {
 			/* ignore teardown errors */
 		}
-		try {
-			if (this.reader) await this.reader.cancel();
-			if (this.port) await this.port.close();
-		} catch {
-			/* ignore teardown errors */
-		}
 		this.dataChar = this.cmdChar = this.dev = null;
-		this.reader = this.port = null;
+		this.tgParser = null;
 		this.setMode('idle', '#2a3329');
 		this.msg('halted');
 	}
