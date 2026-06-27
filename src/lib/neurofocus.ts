@@ -7,6 +7,7 @@
 
 import * as dsp from './dsp';
 import type { FilterChain, Psd } from './dsp';
+import { ThinkGearParser } from './thinkgear';
 
 // Web Bluetooth isn't in the default DOM lib; keep these loosely typed.
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -60,10 +61,14 @@ export class NeuroFocus {
 	private dataChar: Ble = null;
 	private cmdChar: Ble = null;
 
-	// NeuroSky reaches the browser through the local bridge (bridge/neurosky-bridge.ts):
-	// ThinkGear Connector → WebSocket. A browser can't get MindWave raw EEG directly.
-	private nsSocket: WebSocket | null = null;
-	private readonly NS_BRIDGE_URL = 'ws://localhost:8127';
+	// NeuroSky MindWave: the headset's Bluetooth-serial link streams raw EEG (512 Hz)
+	// continuously with no enable command — so the browser reads it directly over the
+	// Web Serial API (no ThinkGear Connector, no bridge). Needs the one-time NeuroSky
+	// driver so the headset shows up as a serial port (/dev/cu.MindWaveMobile-*).
+	private nsPort: Ble = null;
+	private nsReader: Ble = null;
+	private nsAbort = false;
+	private readonly NS_BAUD = 57600;
 
 	// NeuroSky raw ThinkGear unit -> µV (~0.51 µV/unit; the value NF-ios uses).
 	// Uncalibrated, but the eyes-open/closed alpha ratio is relative so unaffected.
@@ -478,63 +483,67 @@ export class NeuroFocus {
 		this.ingestMany(vals, false);
 	}
 
-	// ---------- NeuroSky MindWave (local bridge → WebSocket) ----------
-	// The browser can't read MindWave raw EEG directly, so it talks to the local
-	// bridge (run `bun run bridge` for a headset via ThinkGear Connector, or
-	// `bun run bridge:mock` for synthetic data). Raw arrives as ThinkGear units.
-	connectNeuroSky(): void {
-		if (this.nsSocket) {
-			try {
-				this.nsSocket.close();
-			} catch {
-				/* ignore */
+	// ---------- NeuroSky MindWave (Web Serial / ThinkGear, all in-browser) ----------
+	// The MindWave streams raw EEG continuously over its Bluetooth-serial link, so
+	// we read it straight from the browser — no ThinkGear Connector, no bridge.
+	// Pick the headset's serial port (it appears as /dev/cu.MindWaveMobile-* once
+	// the one-time NeuroSky driver is installed and the headset is paired).
+	async connectNeuroSky(): Promise<void> {
+		const nav = navigator as Navigator & { serial?: Ble };
+		if (!nav.serial) {
+			const b = this.el('nf-banner');
+			if (b) {
+				b.style.display = 'block';
+				b.textContent =
+					'⚠ Web Serial unavailable — NeuroSky needs Chrome / Edge on desktop (open BERGER-1 standalone, not in a frame).';
 			}
-			this.nsSocket = null;
-		}
-		this.msg('connecting to NeuroSky bridge at ' + this.NS_BRIDGE_URL + ' …');
-		let ws: WebSocket;
-		try {
-			ws = new WebSocket(this.NS_BRIDGE_URL);
-		} catch (e) {
-			this.msg('NeuroSky bridge error: ' + (e instanceof Error ? e.message : String(e)));
+			this.msg('Web Serial not available — use Chrome / Edge on desktop.');
 			return;
 		}
-		this.nsSocket = ws;
-		ws.onopen = () => {
+		try {
+			this.msg('select the MindWave serial port…');
+			const port: Ble = await nav.serial.requestPort();
+			await port.open({ baudRate: this.NS_BAUD });
+			this.nsPort = port;
+			this.nsAbort = false;
 			this.stopDemo();
 			this.reset();
 			this.setFs(512);
 			this.unit = 'uV';
 			this.setMode('live · neurosky', '#5fe886');
-			this.msg('NeuroSky bridge connected — streaming 512 Hz');
-		};
-		ws.onmessage = (ev: MessageEvent) => this.onBridge(ev);
-		ws.onerror = () => {
-			this.msg(
-				'NeuroSky bridge not reachable — run `bun run bridge:mock` (or `bun run bridge` with ThinkGear Connector).'
-			);
-		};
-		ws.onclose = () => {
-			if (this.nsSocket === ws) {
-				this.nsSocket = null;
-				this.setMode('idle', '#2a3329');
-			}
-		};
+			this.msg('NeuroSky MindWave linked — streaming raw EEG @ 512 Hz');
+			void this.readMindWave();
+		} catch (e) {
+			const m = e instanceof Error ? e.message : String(e);
+			// requestPort throws "No port selected" when the user cancels the chooser.
+			this.msg(/No port selected/i.test(m) ? 'NeuroSky: no port selected' : 'NeuroSky: ' + m);
+		}
 	}
 
-	private onBridge(ev: MessageEvent): void {
-		let msg: { raw?: number[]; poorSignal?: number };
+	private async readMindWave(): Promise<void> {
+		const parser = new ThinkGearParser();
 		try {
-			msg = JSON.parse(typeof ev.data === 'string' ? ev.data : '') as {
-				raw?: number[];
-				poorSignal?: number;
-			};
-		} catch {
-			return;
+			while (this.nsPort && this.nsPort.readable && !this.nsAbort) {
+				this.nsReader = this.nsPort.readable.getReader();
+				try {
+					for (;;) {
+						const { value, done } = await this.nsReader.read();
+						if (done || this.nsAbort) break;
+						if (!value) continue;
+						const r = parser.push(value as Uint8Array);
+						for (const s of r.raw) this.ingest(s * this.NEUROSKY_UV, true);
+						if (r.poorSignal !== undefined && r.poorSignal >= 200)
+							this.msg('MindWave: no contact — sit still and adjust the headset / ear clip');
+					}
+				} finally {
+					this.nsReader.releaseLock();
+					this.nsReader = null;
+				}
+			}
+		} catch (e) {
+			if (!this.nsAbort)
+				this.msg('NeuroSky stream error: ' + (e instanceof Error ? e.message : String(e)));
 		}
-		if (Array.isArray(msg.raw)) for (const s of msg.raw) this.ingest(s * this.NEUROSKY_UV, true);
-		if (msg.poorSignal !== undefined && msg.poorSignal >= 200)
-			this.msg('MindWave: no contact — adjust the headset');
 	}
 
 	// ---------- Emotiv (Cortex API) — not yet implemented ----------
@@ -599,14 +608,7 @@ export class NeuroFocus {
 
 	async stopAll(): Promise<void> {
 		this.stopDemo();
-		if (this.nsSocket) {
-			try {
-				this.nsSocket.close();
-			} catch {
-				/* ignore */
-			}
-			this.nsSocket = null;
-		}
+		this.nsAbort = true;
 		try {
 			if (this.cmdChar) await this.cmdChar.writeValue(new TextEncoder().encode('s'));
 			if (this.dataChar) await this.dataChar.stopNotifications();
@@ -614,7 +616,14 @@ export class NeuroFocus {
 		} catch {
 			/* ignore teardown errors */
 		}
+		try {
+			if (this.nsReader) await this.nsReader.cancel();
+			if (this.nsPort) await this.nsPort.close();
+		} catch {
+			/* ignore teardown errors */
+		}
 		this.dataChar = this.cmdChar = this.dev = null;
+		this.nsReader = this.nsPort = null;
 		this.setMode('idle', '#2a3329');
 		this.msg('halted');
 	}
