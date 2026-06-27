@@ -7,7 +7,6 @@
 
 import * as dsp from './dsp';
 import type { FilterChain, Psd } from './dsp';
-import { ThinkGearParser } from './thinkgear';
 
 // Web Bluetooth isn't in the default DOM lib; keep these loosely typed.
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -19,7 +18,13 @@ interface CmpEntry {
 	alpha: number;
 }
 
-const GREEK: Record<dsp.BandName, string> = { delta: 'δ', theta: 'θ', alpha: 'α', beta: 'β', gamma: 'γ' };
+const GREEK: Record<dsp.BandName, string> = {
+	delta: 'δ',
+	theta: 'θ',
+	alpha: 'α',
+	beta: 'β',
+	gamma: 'γ'
+};
 
 export class NeuroFocus {
 	private readonly SERVICE = '0338ff7c-6251-4029-a5d5-24e4fa856c8d';
@@ -54,14 +59,11 @@ export class NeuroFocus {
 	private dev: Ble = null;
 	private dataChar: Ble = null;
 	private cmdChar: Ble = null;
-	private tgParser: ThinkGearParser | null = null;
 
-	// NeuroSky MindWave Mobile 2 BLE GATT (UUIDs confirmed on-device by NF-ios):
-	// ThinkGear stream on the F4 notify char; F0 service; A0 command (write 0x02
-	// to enable the raw + normal output mode). Lowercase for Web Bluetooth.
-	private readonly NS_SERVICE = '039afff0-2c94-11e3-9e06-0002a5d5c51b';
-	private readonly NS_DATA = '039afff4-2c94-11e3-9e06-0002a5d5c51b';
-	private readonly NS_CMD = '039affa0-2c94-11e3-9e06-0002a5d5c51b';
+	// NeuroSky reaches the browser through the local bridge (bridge/neurosky-bridge.ts):
+	// ThinkGear Connector → WebSocket. A browser can't get MindWave raw EEG directly.
+	private nsSocket: WebSocket | null = null;
+	private readonly NS_BRIDGE_URL = 'ws://localhost:8127';
 
 	// NeuroSky raw ThinkGear unit -> µV (~0.51 µV/unit; the value NF-ios uses).
 	// Uncalibrated, but the eyes-open/closed alpha ratio is relative so unaffected.
@@ -116,7 +118,10 @@ export class NeuroFocus {
 		const d = this.el('nf-dot');
 		if (!d) return;
 		d.style.background = color;
-		d.style.boxShadow = name === 'idle' ? '0 0 0 1px rgba(0,0,0,.5)' : `0 0 9px 1px ${color},0 0 0 1px rgba(0,0,0,.4)`;
+		d.style.boxShadow =
+			name === 'idle'
+				? '0 0 0 1px rgba(0,0,0,.5)'
+				: `0 0 9px 1px ${color},0 0 0 1px rgba(0,0,0,.4)`;
 		d.style.animation = name === 'idle' ? 'none' : 'nf-pulse 1.6s infinite';
 	}
 
@@ -341,7 +346,13 @@ export class NeuroFocus {
 				const sy = pad.t + areaH - (s + 1) * (segH + gap) + gap,
 					f = s / segs,
 					on = s < lit;
-				const col = !on ? 'rgba(255,170,60,.10)' : f < 0.62 ? '#ffb33a' : f < 0.85 ? '#ff7a2a' : '#ff3a3a';
+				const col = !on
+					? 'rgba(255,170,60,.10)'
+					: f < 0.62
+						? '#ffb33a'
+						: f < 0.85
+							? '#ff7a2a'
+							: '#ff3a3a';
 				x.fillStyle = col;
 				if (on) {
 					x.save();
@@ -467,64 +478,63 @@ export class NeuroFocus {
 		this.ingestMany(vals, false);
 	}
 
-	// ---------- NeuroSky MindWave Mobile 2 (BLE GATT / ThinkGear) ----------
-	// Mirrors the NF-ios CoreBluetooth path: subscribe to the F4 notify char,
-	// write 0x02 to the A0 command char to enable streaming, parse ThinkGear.
-	// Caveat (per NF-ios): on MWM2 the 0x02 enable alone is sometimes not enough
-	// for raw — reliable raw needs NeuroSky's SDK handshake, which a browser
-	// can't run. We may still get eSense (signal/attention) even without raw.
-	async connectNeuroSky(): Promise<void> {
-		const nav = navigator as Navigator & { bluetooth?: Ble };
-		if (!nav.bluetooth) {
-			this.msg('Web Bluetooth not available — open BERGER-1 standalone in Chrome / Edge.');
+	// ---------- NeuroSky MindWave (local bridge → WebSocket) ----------
+	// The browser can't read MindWave raw EEG directly, so it talks to the local
+	// bridge (run `bun run bridge` for a headset via ThinkGear Connector, or
+	// `bun run bridge:mock` for synthetic data). Raw arrives as ThinkGear units.
+	connectNeuroSky(): void {
+		if (this.nsSocket) {
+			try {
+				this.nsSocket.close();
+			} catch {
+				/* ignore */
+			}
+			this.nsSocket = null;
+		}
+		this.msg('connecting to NeuroSky bridge at ' + this.NS_BRIDGE_URL + ' …');
+		let ws: WebSocket;
+		try {
+			ws = new WebSocket(this.NS_BRIDGE_URL);
+		} catch (e) {
+			this.msg('NeuroSky bridge error: ' + (e instanceof Error ? e.message : String(e)));
 			return;
 		}
-		try {
-			this.msg('requesting MindWave…');
-			const dev: Ble = await nav.bluetooth.requestDevice({
-				filters: [{ services: [this.NS_SERVICE] }, { namePrefix: 'MindWave' }, { namePrefix: 'NeuroSky' }],
-				optionalServices: [this.NS_SERVICE]
-			});
-			this.dev = dev;
-			dev.addEventListener('gattserverdisconnected', () => {
-				this.setMode('idle', '#2a3329');
-				this.msg('MindWave disconnected');
-			});
-			const server: Ble = await dev.gatt.connect();
-			const svc: Ble = await server.getPrimaryService(this.NS_SERVICE);
-			this.dataChar = await svc.getCharacteristic(this.NS_DATA);
-			this.cmdChar = await svc.getCharacteristic(this.NS_CMD);
+		this.nsSocket = ws;
+		ws.onopen = () => {
 			this.stopDemo();
 			this.reset();
 			this.setFs(512);
 			this.unit = 'uV';
-			this.tgParser = new ThinkGearParser();
-			await this.dataChar.startNotifications();
-			this.dataChar.addEventListener('characteristicvaluechanged', (e: Event) => this.onThinkGear(e));
-			// Enable raw + normal output (0x02). Best-effort; ignore write errors.
-			try {
-				await this.cmdChar.writeValue(new Uint8Array([0x02]));
-			} catch {
-				/* some MWM2 firmwares reject the write but still stream once subscribed */
+			this.setMode('live · neurosky', '#5fe886');
+			this.msg('NeuroSky bridge connected — streaming 512 Hz');
+		};
+		ws.onmessage = (ev: MessageEvent) => this.onBridge(ev);
+		ws.onerror = () => {
+			this.msg(
+				'NeuroSky bridge not reachable — run `bun run bridge:mock` (or `bun run bridge` with ThinkGear Connector).'
+			);
+		};
+		ws.onclose = () => {
+			if (this.nsSocket === ws) {
+				this.nsSocket = null;
+				this.setMode('idle', '#2a3329');
 			}
-			this.setMode('live · mindwave', '#5fe886');
-			this.msg('linked to ' + (dev.name || 'MindWave') + ' — 512 Hz ThinkGear');
-		} catch (e) {
-			this.msg('NeuroSky: ' + (e instanceof Error ? e.message : String(e)));
-		}
+		};
 	}
 
-	private onThinkGear(e: Event): void {
-		const target = e.target as { value?: DataView };
-		if (!target.value || !this.tgParser) return;
-		const bytes = new Uint8Array(target.value.buffer, target.value.byteOffset, target.value.byteLength);
-		const r = this.tgParser.push(bytes);
-		if (!r.raw.length) this.ovf++;
-		for (const s of r.raw) this.ingest(s * this.NEUROSKY_UV, true);
-		if (r.poorSignal !== undefined) {
-			if (r.poorSignal >= 200) this.msg('MindWave: no contact — adjust the headset');
-			else if (r.poorSignal > 0) this.msg('MindWave: signal noisy (' + r.poorSignal + ')');
+	private onBridge(ev: MessageEvent): void {
+		let msg: { raw?: number[]; poorSignal?: number };
+		try {
+			msg = JSON.parse(typeof ev.data === 'string' ? ev.data : '') as {
+				raw?: number[];
+				poorSignal?: number;
+			};
+		} catch {
+			return;
 		}
+		if (Array.isArray(msg.raw)) for (const s of msg.raw) this.ingest(s * this.NEUROSKY_UV, true);
+		if (msg.poorSignal !== undefined && msg.poorSignal >= 200)
+			this.msg('MindWave: no contact — adjust the headset');
 	}
 
 	// ---------- Emotiv (Cortex API) — not yet implemented ----------
@@ -558,7 +568,12 @@ export class NeuroFocus {
 
 	startDemo(): void {
 		this.stopDemo();
-		const cap = dsp.generateSynthetic({ fs: 600, dur: 12, alphaAmp: this.demoAlpha, label: 'eyes-closed' });
+		const cap = dsp.generateSynthetic({
+			fs: 600,
+			dur: 12,
+			alphaAmp: this.demoAlpha,
+			label: 'eyes-closed'
+		});
 		this.reset();
 		this.setFs(600);
 		this.unit = 'uV';
@@ -584,6 +599,14 @@ export class NeuroFocus {
 
 	async stopAll(): Promise<void> {
 		this.stopDemo();
+		if (this.nsSocket) {
+			try {
+				this.nsSocket.close();
+			} catch {
+				/* ignore */
+			}
+			this.nsSocket = null;
+		}
 		try {
 			if (this.cmdChar) await this.cmdChar.writeValue(new TextEncoder().encode('s'));
 			if (this.dataChar) await this.dataChar.stopNotifications();
@@ -592,7 +615,6 @@ export class NeuroFocus {
 			/* ignore teardown errors */
 		}
 		this.dataChar = this.cmdChar = this.dev = null;
-		this.tgParser = null;
 		this.setMode('idle', '#2a3329');
 		this.msg('halted');
 	}
@@ -603,7 +625,9 @@ export class NeuroFocus {
 			this.msg('not enough data captured yet');
 			return;
 		}
-		const seg = Float64Array.from(this.filt.slice(-Math.min(this.filt.length, Math.round(this.fs * 4))));
+		const seg = Float64Array.from(
+			this.filt.slice(-Math.min(this.filt.length, Math.round(this.fs * 4)))
+		);
 		const { freqs, psd } = dsp.welch(seg, this.fs, this.welchN, 0.5);
 		this.cmp[which] = { freqs, psd, alpha: dsp.bandPowers(freqs, psd).alpha };
 		this.msg('captured eyes-' + which + ' spectrum');
