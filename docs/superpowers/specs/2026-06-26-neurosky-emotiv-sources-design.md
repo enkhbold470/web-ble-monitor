@@ -12,9 +12,13 @@ test working with every source.
 ## Connectivity reality (why each source differs)
 
 - **Custom firmware (existing):** Web Bluetooth / GATT, ASCII-integer frames. Unchanged.
-- **NeuroSky MindWave:** Bluetooth *Classic* (SPP/RFCOMM) — invisible to Web
-  Bluetooth. Reached via the **Web Serial API** once OS-paired, parsing the
-  **ThinkGear (TGAM)** binary stream. Gives raw 512 Hz EEG → full PSD works.
+- **NeuroSky MindWave Mobile 2:** **BLE GATT** (Web Bluetooth). UUIDs confirmed
+  on-device by the NF-ios project: service `039afff0-2c94-11e3-9e06-0002a5d5c51b`,
+  ThinkGear notify char `039afff4-…`, command char `039affa0-…` (write `0x02`).
+  Parse the **ThinkGear (TGAM)** binary stream; raw 512 Hz EEG, scale 0.51 µV/unit.
+  Caveat (NF-ios): reliable raw on MWM2 needed NeuroSky's SDK handshake — pure
+  GATT may connect and give eSense but not guaranteed raw. (Classic MindWave 1 /
+  USB dongle is Bluetooth Classic / serial — not implemented.)
 - **Emotiv (EPOC/Insight):** raw EEG is AES-encrypted; only obtainable via the
   paid **Cortex API** (local WebSocket). Out of scope for now → "coming soon" stub.
 
@@ -34,10 +38,11 @@ Streaming ThinkGear/TGAM packet parser. Stateful across byte chunks.
 - Invalid checksums / partial packets are buffered, not thrown.
 
 ### 2. `neurofocus.ts` — adapter methods
-- `connectNeuroSky()`: `navigator.serial.requestPort()` → open at **57600 baud**
-  → async read loop feeds bytes to `ThinkGearParser` → raw samples via `ingest()`
-  at `fs = 512`, converted to approximate µV (NeuroSky raw scale, commented).
-  Reuses `reset()` / `setFs()` / `setMode('live · neurosky', …)`.
+- `connectNeuroSky()`: Web Bluetooth → `requestDevice` (NS service / MindWave name)
+  → subscribe to the F4 notify char → write `0x02` to the A0 command char →
+  `characteristicvaluechanged` feeds bytes to `ThinkGearParser` → raw samples via
+  `ingest()` at `fs = 512`, scaled 0.51 µV/unit. Reuses the existing
+  `dev`/`dataChar`/`cmdChar` fields + `reset()` / `setFs()` / `setMode('live · mindwave', …)`.
 - `connectEmotiv()`: status-line stub — "Emotiv (Cortex API) — coming soon".
 - `stopAll()`: also cancels the serial reader and closes the port.
 - Capability guard: missing `navigator.serial` → banner message (mirrors the
