@@ -295,10 +295,19 @@ export interface Capture {
 
 /** Parse a neurofocus_ble_eeg_v1 capture JSON. */
 export function parseCapture(text: string): Capture {
-	const doc = JSON.parse(text) as { samples?: unknown; effective_rate_sps?: unknown; fs?: unknown; units?: unknown };
+	const doc = JSON.parse(text) as {
+		samples?: unknown;
+		nominal_rate_sps?: unknown;
+		effective_rate_sps?: unknown;
+		fs?: unknown;
+		units?: unknown;
+	};
 	const samples = doc.samples;
 	if (!Array.isArray(samples) || samples.length === 0) throw new Error('no samples[] in JSON');
-	const fs = Number(doc.effective_rate_sps) || Number(doc.fs) || 600;
+	// Use the NOMINAL device rate, never effective_rate_sps (= samples/elapsed). The effective
+	// rate sags whenever BLE drops samples, and feeding it to Welch compresses the whole
+	// frequency axis (a real 60 Hz line slides toward ~48 Hz). Mirrors eeg_process_segment.py.
+	const fs = Number(doc.nominal_rate_sps) || Number(doc.fs) || Number(doc.effective_rate_sps) || 600;
 	const units = String(doc.units ?? '').toLowerCase();
 	const unit: 'counts' | 'uV' = units.includes('uv') || units.includes('micro') || units.includes('volt') ? 'uV' : 'counts';
 	return { fs, unit, samples: (samples as unknown[]).map(Number) };
