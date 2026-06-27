@@ -1,0 +1,106 @@
+import { describe, it, expect } from 'vitest';
+import {
+	nextPow2,
+	countsToUv,
+	makeChain,
+	welch,
+	peakFreq,
+	bandPowers,
+	parseFrame,
+	parseCapture,
+	generateSynthetic
+} from './dsp';
+
+const nearestBin = (freqs: Float64Array, f: number): number => {
+	let bi = 0,
+		bd = Infinity;
+	for (let i = 0; i < freqs.length; i++) {
+		const d = Math.abs(freqs[i] - f);
+		if (d < bd) {
+			bd = d;
+			bi = i;
+		}
+	}
+	return bi;
+};
+
+describe('dsp helpers', () => {
+	it('nextPow2 rounds up to powers of two', () => {
+		expect(nextPow2(1)).toBe(1);
+		expect(nextPow2(600)).toBe(1024);
+		expect(nextPow2(1024)).toBe(1024);
+	});
+
+	it('countsToUv matches the ADS1220 24-bit scaling (Python pipeline)', () => {
+		// 12738 counts ≈ 50 µV electrode-referred at gain 100 (SIGNAL_CALCULATIONS example)
+		const uv = countsToUv(12738, { adcBits: 24, vref: 3.3, gain: 100, line: 60 });
+		expect(uv).toBeGreaterThan(49);
+		expect(uv).toBeLessThan(51);
+	});
+
+	it('parseFrame reads space-separated ASCII integers', () => {
+		expect(parseFrame('129775 129640 129812\n')).toEqual([129775, 129640, 129812]);
+		expect(parseFrame('  10   -20\t30 ')).toEqual([10, -20, 30]);
+		expect(parseFrame('')).toEqual([]);
+	});
+
+	it('parseCapture reads a neurofocus_ble_eeg_v1 doc', () => {
+		const cap = parseCapture(
+			JSON.stringify({ effective_rate_sps: 253.4, units: 'ads1220_raw_counts', samples: [1, 2, 3] })
+		);
+		expect(cap.fs).toBeCloseTo(253.4, 1);
+		expect(cap.unit).toBe('counts');
+		expect(cap.samples).toEqual([1, 2, 3]);
+	});
+});
+
+describe('PSD', () => {
+	it('locates a 10 Hz tone as the alpha peak', () => {
+		const fs = 600;
+		const x = Float64Array.from({ length: fs * 8 }, (_, i) => Math.sin((2 * Math.PI * 10 * i) / fs));
+		const { freqs, psd } = welch(x, fs, 1024, 0.5);
+		const pk = peakFreq(freqs, psd, 7, 13);
+		expect(pk).not.toBeNull();
+		expect(Math.abs((pk as number) - 10)).toBeLessThan(1);
+	});
+
+	it('filter chain preserves alpha, kills mains and drift', () => {
+		const fs = 600;
+		const N = fs * 10;
+		const raw = new Float64Array(N);
+		for (let i = 0; i < N; i++) {
+			const t = i / fs;
+			raw[i] =
+				3000 * Math.sin(2 * Math.PI * 10 * t) + // alpha
+				8000 * Math.sin(2 * Math.PI * 60 * t) + // mains
+				6000 * Math.sin(2 * Math.PI * 0.2 * t); // drift
+		}
+		const chain = makeChain(fs, { lo: 1, hi: 45, line: 60 });
+		const filt = new Float64Array(N);
+		for (let i = 0; i < N; i++) filt[i] = chain.step(raw[i]);
+
+		// drop 1 s of filter transient
+		const a = raw.subarray(fs);
+		const b = filt.subarray(fs);
+		const pr = welch(a, fs, 1024, 0.5);
+		const pf = welch(b, fs, 1024, 0.5);
+
+		const i10 = nearestBin(pr.freqs, 10);
+		const i60 = nearestBin(pr.freqs, 60);
+
+		// alpha preserved (within passband), mains crushed by notch + low-pass
+		expect(pf.psd[i10] / pr.psd[i10]).toBeGreaterThan(0.4);
+		expect(pf.psd[i60] / pr.psd[i60]).toBeLessThan(0.05);
+	});
+
+	it('synthetic eyes-closed signal is alpha-dominant after filtering', () => {
+		const fs = 600;
+		const { samples } = generateSynthetic({ fs, dur: 10, alphaAmp: 18, label: 'eyes-closed' });
+		const chain = makeChain(fs, { lo: 1, hi: 45, line: 60 });
+		const filt = Float64Array.from(samples, (v) => chain.step(v));
+		const { freqs, psd } = welch(filt.subarray(fs), fs, 1024, 0.5);
+		const bp = bandPowers(freqs, psd);
+		expect(bp.alpha).toBeGreaterThan(bp.beta);
+		expect(bp.alpha).toBeGreaterThan(bp.gamma);
+	});
+});
