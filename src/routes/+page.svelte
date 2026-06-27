@@ -267,8 +267,9 @@
 					<button class="nf-btn nf-src nf-stop" onclick={() => app?.stopAll()}>■ Stop</button>
 				</div>
 				<span style="font:500 9px 'Space Mono',monospace;letter-spacing:.3px;color:#8a8068"
-					>NeuroSky → run <b style="color:#6a6149">bun run bridge:mock</b> (or
-					<b style="color:#6a6149">bun run bridge</b> with ThinkGear Connector)</span
+					>NeuroSky → pair the MindWave, then click NeuroSky and pick its serial port (<b
+						style="color:#6a6149">MindWaveMobile</b
+					>). Chrome / Edge desktop · no app needed.</span
 				>
 			</div>
 
