@@ -500,6 +500,21 @@ export class NeuroFocus {
 			this.msg('Web Serial not available — use Chrome / Edge on desktop.');
 			return;
 		}
+		// Release any port we already hold — re-clicking NeuroSky must not collide
+		// with our own open handle (that self-inflicts "Failed to open / busy").
+		this.nsAbort = true;
+		try {
+			if (this.nsReader) await this.nsReader.cancel();
+		} catch {
+			/* ignore */
+		}
+		try {
+			if (this.nsPort) await this.nsPort.close();
+		} catch {
+			/* ignore */
+		}
+		this.nsReader = this.nsPort = null;
+		this.nsAbort = false;
 		let port: Ble;
 		try {
 			this.msg('select the MindWave serial port (MindWaveMobile)…');
@@ -548,14 +563,13 @@ export class NeuroFocus {
 		const b = this.el('nf-banner');
 		if (b) {
 			b.style.display = 'block';
-			// The port exists (paired) but couldn't be opened — the headset isn't
-			// actively connected. Give the exact steps rather than the raw error.
+			// "Failed to open" almost always means the port is busy (held by another
+			// browser/tab/process) or the headset is paired-but-not-connected.
 			b.innerHTML =
-				'⚠ Couldn’t open the MindWave port — it’s <b>paired but not connected</b>. ' +
-				'1) Turn the headset ON and wear it. ' +
-				'2) In macOS  Bluetooth settings it must show <b>“Connected”</b> with a <b>solid</b> blue LED (not blinking) — click Connect if it doesn’t. ' +
-				'3) Quit any other app using it (ThinkGear, the phone app). ' +
-				'4) Click NeuroSky again. If two “MindWaveMobile” entries appear, try the other one.';
+				'⚠ Couldn’t open the MindWave port. Most likely it’s <b>held by another browser or tab</b> — ' +
+				'close every other BERGER tab and <b>fully quit other browsers</b> (Dia, Chrome, Arc, Edge), then click NeuroSky again. ' +
+				'Otherwise the headset is <b>paired but not connected</b>: turn it ON and confirm macOS Bluetooth shows <b>“Connected”</b> (solid LED). ' +
+				'If two “MindWaveMobile” ports are listed, pick the other one.';
 		}
 	}
 
