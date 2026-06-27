@@ -1,23 +1,25 @@
-node_modules/
-/.next/
-/.open-next/
-/out/
+node_modules
+
+# Output
+.output
+.vercel
+.netlify
+.wrangler
+/.svelte-kit
 /build
 
-# env / secrets
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
 .env
 .env.*
-!.env.local.example
-.dev.vars
-**/.dev.vars
-!.dev.vars.example
+!.env.example
+!.env.test
 
-# tooling
-*.tsbuildinfo
-next-env.d.ts
-.wrangler/
-.vercel
-.DS_Store
-
-.wrangler/
-/dist/
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+# Playwright
+test-results
