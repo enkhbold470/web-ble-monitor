@@ -1,0 +1,64 @@
+# NeuroSky + Emotiv source support
+
+**Date:** 2026-06-26
+**Status:** Approved
+
+## Goal
+
+Let BERGER·1 acquire EEG from consumer headsets in addition to the existing
+custom-firmware BLE device, and keep the manual eyes-open / eyes-closed alpha
+test working with every source.
+
+## Connectivity reality (why each source differs)
+
+- **Custom firmware (existing):** Web Bluetooth / GATT, ASCII-integer frames. Unchanged.
+- **NeuroSky MindWave:** Bluetooth *Classic* (SPP/RFCOMM) — invisible to Web
+  Bluetooth. Reached via the **Web Serial API** once OS-paired, parsing the
+  **ThinkGear (TGAM)** binary stream. Gives raw 512 Hz EEG → full PSD works.
+- **Emotiv (EPOC/Insight):** raw EEG is AES-encrypted; only obtainable via the
+  paid **Cortex API** (local WebSocket). Out of scope for now → "coming soon" stub.
+
+The DSP pipeline (`welch`, `bandPowers`, eyes-open/closed compare) is
+source-agnostic: everything flows through `ingest()` → `this.filt`. So this work
+adds **input adapters only**, no DSP or test-flow changes.
+
+## Components
+
+### 1. `src/lib/thinkgear.ts` (new, pure, unit-tested)
+Streaming ThinkGear/TGAM packet parser. Stateful across byte chunks.
+- Framing: `0xAA 0xAA` sync, payload length, payload, checksum (validated).
+- Payload codes consumed:
+  - `0x80` raw EEG — 16-bit big-endian signed, 512 Hz → emitted as samples.
+  - `0x02` poor-signal (0 good … 200 no-contact), `0x04` attention, `0x05` meditation → status.
+- API: `push(bytes: Uint8Array): { raw: number[]; poorSignal?: number; attention?: number; meditation?: number }`.
+- Invalid checksums / partial packets are buffered, not thrown.
+
+### 2. `neurofocus.ts` — adapter methods
+- `connectNeuroSky()`: `navigator.serial.requestPort()` → open at **57600 baud**
+  → async read loop feeds bytes to `ThinkGearParser` → raw samples via `ingest()`
+  at `fs = 512`, converted to approximate µV (NeuroSky raw scale, commented).
+  Reuses `reset()` / `setFs()` / `setMode('live · neurosky', …)`.
+- `connectEmotiv()`: status-line stub — "Emotiv (Cortex API) — coming soon".
+- `stopAll()`: also cancels the serial reader and closes the port.
+- Capability guard: missing `navigator.serial` → banner message (mirrors the
+  existing Web Bluetooth guard).
+
+### 3. `+page.svelte` — source picker
+Add to the existing SIGNAL SOURCE row: a `∿ NeuroSky` button and a disabled
+`Emotiv · soon` button, alongside Test / File / BLE. Eyes-open/closed manual
+capture and alpha-ratio readout are untouched.
+
+## Decisions
+
+- **Scaling:** NeuroSky raw is not calibrated µV; the alpha ratio (C/O) is
+  relative and unaffected. Absolute µV labels are approximate — acceptable, same
+  as the synthetic demo.
+- **No new dependencies:** Web Serial is a browser API.
+- **Browser support:** Web Serial is Chromium desktop only; non-supporting
+  browsers get a clear banner message.
+
+## Testing
+
+- Unit tests for `thinkgear.ts`: valid packet, raw-sample decode, split across
+  chunks, bad checksum dropped, sync resync after garbage.
+- Manual: NeuroSky button streams; eyes-open/closed compare + alpha ratio update.
