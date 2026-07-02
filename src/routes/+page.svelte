@@ -1,8 +1,21 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { NeuroFocus } from '$lib/neurofocus';
+	import { NeuroFocus, type AdcProfile } from '$lib/neurofocus';
 
 	let app: NeuroFocus | undefined;
+	// Active ADC scaling profile: v2 = ESP32-C3 12-bit unipolar, v4 = ADS1220 24-bit bipolar.
+	let adc = $state<AdcProfile>('v4');
+
+	function setAdc(p: AdcProfile): void {
+		adc = p;
+		app?.setAdcProfile(p);
+	}
+
+	// The ESP32 v2 board forces the 12-bit profile on connect — keep the toggle in sync.
+	function connectEsp32(): void {
+		adc = 'v2';
+		void app?.connectBLE();
+	}
 
 	onMount(() => {
 		app = new NeuroFocus();
@@ -148,9 +161,35 @@
 						style="font:600 10px 'Saira Condensed';letter-spacing:2.5px;color:rgba(140,235,168,.7)"
 						>EEG ACTIVITY · CH1 · BAND-PASS 1–45 Hz</span
 					>
-					<span style="font:400 10px 'Space Mono',monospace;color:rgba(140,235,168,.45)"
-						>µV · 4 s SWEEP</span
-					>
+					<div style="display:flex;align-items:center;gap:8px">
+						<!-- ADC SCALING PROFILE toggle: swaps counts→µV between the v2 12-bit
+						     unipolar ESP32-C3 ADC and the v4 24-bit bipolar ADS1220. -->
+						<div
+							style="display:flex;border-radius:5px;overflow:hidden;border:1px solid rgba(140,235,168,.3)"
+						>
+							<button
+								type="button"
+								title="ESP32-C3 internal ADC · 12-bit · unipolar (firmware v2)"
+								onclick={() => setAdc('v2')}
+								style="cursor:pointer;border:none;padding:3px 8px;font:600 9px 'Space Mono',monospace;letter-spacing:.5px;{adc ===
+								'v2'
+									? 'background:rgba(95,232,134,.85);color:#06120a'
+									: 'background:transparent;color:rgba(140,235,168,.55)'}">V2 · 12-bit</button
+							>
+							<button
+								type="button"
+								title="TI ADS1220 · 24-bit · bipolar (firmware v4)"
+								onclick={() => setAdc('v4')}
+								style="cursor:pointer;border:none;padding:3px 8px;font:600 9px 'Space Mono',monospace;letter-spacing:.5px;{adc ===
+								'v4'
+									? 'background:rgba(95,232,134,.85);color:#06120a'
+									: 'background:transparent;color:rgba(140,235,168,.55)'}">V4 · 24-bit</button
+							>
+						</div>
+						<span style="font:400 10px 'Space Mono',monospace;color:rgba(140,235,168,.45)"
+							>µV · 4 s SWEEP</span
+						>
+					</div>
 				</div>
 				<div
 					style="position:relative;flex:0.42;min-height:0;border-radius:5px;overflow:hidden;background:radial-gradient(135% 130% at 50% 32%,#0d1f13,#06100a 64%,#03080500)"
@@ -257,7 +296,7 @@
 				<div style="display:flex;gap:8px">
 					<button class="nf-btn nf-src" onclick={() => app?.startDemo()}>◊ Test</button>
 					<button class="nf-btn nf-src nf-neutral" onclick={() => app?.openFile()}>▤ File</button>
-					<button class="nf-btn nf-src" onclick={() => app?.connectBLE()}>∿ ESP32</button>
+					<button class="nf-btn nf-src" onclick={() => connectEsp32()}>∿ ESP32</button>
 					<button class="nf-btn nf-src" onclick={() => app?.connectNeuroSky()}>∿ NeuroSky</button>
 					<button
 						class="nf-btn nf-src nf-disabled"

@@ -8,10 +8,15 @@
 //   bandPowers, BAND_DEFS, parseFrame, parseCapture, generateSynthetic
 
 export interface ScaleSettings {
-	adcBits: number; // ADS1220 = 24  (signed full scale 2^23)
-	vref: number; // reference volts (match firmware ads.setVRefValue_V)
-	gain: number; // analog in-amp (AD8422) gain
+	adcBits: number; // ADS1220 = 24  (signed full scale 2^23); ESP32-C3 SAR = 12
+	vref: number; // reference / full-scale volts (match firmware ads.setVRefValue_V, or ADC Vref)
+	gain: number; // analog front-end gain (v4 AD8422 in-amp = 100; v2 discrete AFE ≈ 11000)
 	line: number; // mains frequency (Hz) for the notch
+	// Bipolar (ADS1220 differential, default) uses a signed full scale 2^(adcBits-1).
+	// Set false for a single-ended unipolar ADC (ESP32-C3) whose codes span 0..vref, so
+	// the full scale is 2^adcBits and the mid-scale DC bias must be removed via `offset`.
+	bipolar?: boolean; // default true
+	offset?: number; // counts subtracted before scaling (mid-scale ~2048 for 12-bit unipolar); default 0
 }
 
 export type BandName = 'delta' | 'theta' | 'alpha' | 'beta' | 'gamma';
@@ -30,10 +35,18 @@ export function nextPow2(n: number): number {
 	return p;
 }
 
-/** Raw ADS1220 counts -> electrode-referred µV (matches eeg_process_segment.py). */
+/**
+ * Raw ADC counts -> electrode-referred µV.
+ * Bipolar (ADS1220 differential, default): signed full scale 2^(adcBits-1), matches
+ * eeg_process_segment.py. Unipolar (ESP32-C3 single-ended): full scale 2^adcBits and the
+ * mid-scale DC bias (`offset`) is removed so the code deviation is signed.
+ */
 export function countsToUv(value: number, s: ScaleSettings): number {
-	const fullScale = Math.pow(2, s.adcBits - 1); // signed full scale, 24-bit -> 2^23
-	const uvAdc = value * ((s.vref * 1e6) / fullScale);
+	const bipolar = s.bipolar ?? true;
+	const offset = s.offset ?? 0;
+	const halfScaleCodes = bipolar ? Math.pow(2, s.adcBits - 1) : Math.pow(2, s.adcBits);
+	const centered = value - offset;
+	const uvAdc = centered * ((s.vref * 1e6) / halfScaleCodes);
 	return s.gain > 0 ? uvAdc / s.gain : uvAdc;
 }
 

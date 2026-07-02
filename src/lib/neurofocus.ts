@@ -27,14 +27,35 @@ const GREEK: Record<dsp.BandName, string> = {
 	gamma: 'γ'
 };
 
+export type AdcProfile = 'v2' | 'v4';
+
+// ADC scaling profiles. Selected from the UI and forced on the v2 BLE connect.
+//  - v4: TI ADS1220, 24-bit, differential/bipolar (signed full scale 2^23), AD8422 in-amp gain 100.
+//  - v2: ESP32-C3 internal SAR ADC, 12-bit, single-ended UNIPOLAR biased at VCC/2. Codes 0..4095 span
+//        0..vref, so full scale is 2^12 and the ~2048 mid-scale bias is removed. `gain` is the discrete
+//        two-op-amp AFE gain (nominal ≈ 11000 = x11 in-amp * x1000 output stage, firmware/v2 schematic).
+//        NOTE: vref (ADC full-scale volts) and gain are HARDWARE CONSTANTS to verify/calibrate per board —
+//        the ESP32-C3 ADC is nonlinear and the AFE output stage is frequency-shaped, so a single scalar
+//        gain only approximates in-band µV. offset (2048) is a nominal mid-scale; the 1 Hz high-pass in
+//        makeChain removes any residual DC so exact tracking is not required.
+const ADC_PROFILES: Record<AdcProfile, dsp.ScaleSettings> = {
+	v4: { adcBits: 24, vref: 3.3, gain: 100, line: 60, bipolar: true, offset: 0 },
+	v2: { adcBits: 12, vref: 3.3, gain: 11000, line: 60, bipolar: false, offset: 2048 }
+};
+
 export class NeuroFocus {
 	private readonly SERVICE = '0338ff7c-6251-4029-a5d5-24e4fa856c8d';
 	private readonly DATA = 'ad615f2b-cc93-4155-9e4d-f5f32cb9a2d7';
 	private readonly CMD = 'b5e3d1c9-8a2f-4e7b-9c6d-1a3f5e7b9c2d';
-	private settings: dsp.ScaleSettings = { adcBits: 24, vref: 3.3, gain: 100, line: 60 };
+	private adcProfile: AdcProfile = 'v4';
+	private settings: dsp.ScaleSettings = { ...ADC_PROFILES.v4 };
 	private demoAlpha = 18;
 
 	private fs = 600;
+	// Sample rate for the ESP32 BLE source. MUST match the firmware's SAMPLE_RATE
+	// (firmware/v2 EEGData.h). The board streams one sample per notification at this rate;
+	// the PSD/band-pass are meaningless if this doesn't match the true rate.
+	private readonly BLE_FS = 125;
 	private unit: 'counts' | 'uV' = 'uV';
 	private filt: number[] = [];
 	private filtCap = 0;
@@ -120,6 +141,24 @@ export class NeuroFocus {
 		this.chain = dsp.makeChain(fs, { lo: 1, hi: 45, line: this.settings.line });
 		this.welchN = dsp.nextPow2(Math.min(Math.round(fs * 2), 1024));
 		this.setText('nf-fs', String(Math.round(fs)));
+	}
+
+	// ---------- ADC scaling profile (v2 12-bit unipolar vs v4 24-bit bipolar) ----------
+	// Swaps the counts->µV ScaleSettings and rebuilds the filter chain. Only affects the
+	// counts sources (ESP32 BLE); the µV sources (file/NeuroSky/demo) bypass countsToUv.
+	setAdcProfile(p: AdcProfile): void {
+		this.adcProfile = p;
+		this.settings = { ...ADC_PROFILES[p] };
+		this.setFs(this.fs); // rebuild makeChain with settings.line
+		this.msg(
+			p === 'v2'
+				? 'ADC profile · V2 · ESP32-C3 12-bit unipolar'
+				: 'ADC profile · V4 · ADS1220 24-bit bipolar'
+		);
+	}
+
+	getAdcProfile(): AdcProfile {
+		return this.adcProfile;
 	}
 
 	private setMode(name: string, color: string): void {
@@ -471,8 +510,12 @@ export class NeuroFocus {
 			this.cmdChar = await svc.getCharacteristic(this.CMD);
 			this.stopDemo();
 			this.reset();
-			this.setFs(this.fs);
+			this.setFs(this.BLE_FS);   // match the firmware's true sample rate, not the 600 default
 			this.unit = 'counts';
+			// The ESP32 v2 board streams raw 12-bit unipolar counts, so scale with the v2 profile
+			// (12-bit, mid-scale removed, discrete AFE gain) — the default v4 24-bit/bipolar
+			// profile would render µV ~4096x too small and flatten the CH1 trace.
+			this.setAdcProfile('v2');
 			await this.dataChar.startNotifications();
 			this.dataChar.addEventListener('characteristicvaluechanged', (e: Event) => this.onBle(e));
 			await this.cmdChar.writeValue(new TextEncoder().encode('b'));

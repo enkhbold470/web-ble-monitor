@@ -38,6 +38,18 @@ describe('dsp helpers', () => {
 		expect(uv).toBeLessThan(51);
 	});
 
+	it('countsToUv handles the v2 12-bit unipolar ADC (mid-scale removed, 2^12 full scale)', () => {
+		// ESP32-C3 SAR: codes 0..4095 span 0..vref, biased at mid-scale 2048. LSB (raw pin,
+		// gain 1) = vref / 2^12 in µV; a code deviation `delta` -> delta * (3.3e6/4096) µV.
+		const v2raw = { adcBits: 12, vref: 3.3, gain: 1, line: 60, bipolar: false, offset: 2048 };
+		const lsb = 3.3e6 / 4096; // ≈ 805.66 µV/count
+		expect(countsToUv(2048, v2raw)).toBeCloseTo(0, 6); // mid-scale -> 0 (no DC bias)
+		expect(countsToUv(2148, v2raw)).toBeCloseTo(100 * lsb, 3);
+		expect(countsToUv(1948, v2raw)).toBeCloseTo(-100 * lsb, 3);
+		// with the discrete AFE gain the electrode-referred µV is divided by that gain
+		expect(countsToUv(2148, { ...v2raw, gain: 11000 })).toBeCloseTo((100 * lsb) / 11000, 6);
+	});
+
 	it('parseFrame reads space-separated ASCII integers', () => {
 		expect(parseFrame('129775 129640 129812\n')).toEqual([129775, 129640, 129812]);
 		expect(parseFrame('  10   -20\t30 ')).toEqual([10, -20, 30]);
