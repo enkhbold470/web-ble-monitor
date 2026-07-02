@@ -38,15 +38,21 @@ export type AdcProfile = 'v2' | 'v4';
 //        the ESP32-C3 ADC is nonlinear and the AFE output stage is frequency-shaped, so a single scalar
 //        gain only approximates in-band µV. offset (2048) is a nominal mid-scale; the 1 Hz high-pass in
 //        makeChain removes any residual DC so exact tracking is not required.
-const ADC_PROFILES: Record<AdcProfile, dsp.ScaleSettings> = {
+export const ADC_PROFILES: Record<AdcProfile, dsp.ScaleSettings> = {
 	v4: { adcBits: 24, vref: 3.3, gain: 100, line: 60, bipolar: true, offset: 0 },
 	v2: { adcBits: 12, vref: 3.3, gain: 11000, line: 60, bipolar: false, offset: 2048 }
 };
 
+// BLE GATT contract — matches firmware/v2 (BLEManager.h). Shared with the /ez route.
+export const BLE_SERVICE = '0338ff7c-6251-4029-a5d5-24e4fa856c8d';
+export const BLE_DATA = 'ad615f2b-cc93-4155-9e4d-f5f32cb9a2d7';
+export const BLE_CMD = 'b5e3d1c9-8a2f-4e7b-9c6d-1a3f5e7b9c2d';
+export const BLE_SAMPLE_RATE = 125; // Hz — must match firmware SAMPLE_RATE (EEGData.h)
+
 export class NeuroFocus {
-	private readonly SERVICE = '0338ff7c-6251-4029-a5d5-24e4fa856c8d';
-	private readonly DATA = 'ad615f2b-cc93-4155-9e4d-f5f32cb9a2d7';
-	private readonly CMD = 'b5e3d1c9-8a2f-4e7b-9c6d-1a3f5e7b9c2d';
+	private readonly SERVICE = BLE_SERVICE;
+	private readonly DATA = BLE_DATA;
+	private readonly CMD = BLE_CMD;
 	private adcProfile: AdcProfile = 'v4';
 	private settings: dsp.ScaleSettings = { ...ADC_PROFILES.v4 };
 	private demoAlpha = 18;
@@ -55,7 +61,7 @@ export class NeuroFocus {
 	// Sample rate for the ESP32 BLE source. MUST match the firmware's SAMPLE_RATE
 	// (firmware/v2 EEGData.h). The board streams one sample per notification at this rate;
 	// the PSD/band-pass are meaningless if this doesn't match the true rate.
-	private readonly BLE_FS = 125;
+	private readonly BLE_FS = BLE_SAMPLE_RATE;
 	private unit: 'counts' | 'uV' = 'uV';
 	private filt: number[] = [];
 	private filtCap = 0;
