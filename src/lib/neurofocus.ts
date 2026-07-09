@@ -8,6 +8,17 @@
 import * as dsp from './dsp';
 import type { FilterChain, Psd } from './dsp';
 import { ThinkGearParser } from './thinkgear';
+import { ADC_PROFILES, type AdcProfile } from './adc';
+import {
+	BLE_CMD,
+	BLE_DATA,
+	BLE_SERVICE,
+	NeuroLink,
+	V2_SAMPLE_RATE,
+	V4_SAMPLE_RATE,
+	describeDiag,
+	type DiagReport
+} from './ble';
 
 // Web Bluetooth isn't in the default DOM lib; keep these loosely typed.
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -27,41 +38,26 @@ const GREEK: Record<dsp.BandName, string> = {
 	gamma: 'γ'
 };
 
-export type AdcProfile = 'v2' | 'v4';
+// Re-exported for the /ez and /demo routes, which were importing them from here.
+export { ADC_PROFILES, BLE_SERVICE, BLE_DATA, BLE_CMD };
+export type { AdcProfile };
 
-// ADC scaling profiles. Selected from the UI and forced on the v2 BLE connect.
-//  - v4: TI ADS1220, 24-bit, differential/bipolar (signed full scale 2^23), AD8422 in-amp gain 100.
-//  - v2: ESP32-C3 internal SAR ADC, 12-bit, single-ended UNIPOLAR biased at VCC/2. Codes 0..4095 span
-//        0..vref, so full scale is 2^12 and the ~2048 mid-scale bias is removed. `gain` is the discrete
-//        two-op-amp AFE gain (nominal ≈ 11000 = x11 in-amp * x1000 output stage, firmware/v2 schematic).
-//        NOTE: vref (ADC full-scale volts) and gain are HARDWARE CONSTANTS to verify/calibrate per board —
-//        the ESP32-C3 ADC is nonlinear and the AFE output stage is frequency-shaped, so a single scalar
-//        gain only approximates in-band µV. offset (2048) is a nominal mid-scale; the 1 Hz high-pass in
-//        makeChain removes any residual DC so exact tracking is not required.
-export const ADC_PROFILES: Record<AdcProfile, dsp.ScaleSettings> = {
-	v4: { adcBits: 24, vref: 3.3, gain: 100, line: 60, bipolar: true, offset: 0 },
-	v2: { adcBits: 12, vref: 3.3, gain: 11000, line: 60, bipolar: false, offset: 2048 }
+/**
+ * Nominal ADC rate per board revision. The DSP must use the board's TRUE rate, never a
+ * measured samples/elapsed rate — BLE drops make the measured rate sag, which compresses
+ * the whole frequency axis (a real 60 Hz mains line slides toward ~48 Hz).
+ */
+export const BLE_SAMPLE_RATE: Record<AdcProfile, number> = {
+	v4: V4_SAMPLE_RATE,
+	v2: V2_SAMPLE_RATE
 };
 
-// BLE GATT contract — matches firmware/v2 (BLEManager.h). Shared with the /ez route.
-export const BLE_SERVICE = '0338ff7c-6251-4029-a5d5-24e4fa856c8d';
-export const BLE_DATA = 'ad615f2b-cc93-4155-9e4d-f5f32cb9a2d7';
-export const BLE_CMD = 'b5e3d1c9-8a2f-4e7b-9c6d-1a3f5e7b9c2d';
-export const BLE_SAMPLE_RATE = 125; // Hz — must match firmware SAMPLE_RATE (EEGData.h)
-
 export class NeuroFocus {
-	private readonly SERVICE = BLE_SERVICE;
-	private readonly DATA = BLE_DATA;
-	private readonly CMD = BLE_CMD;
 	private adcProfile: AdcProfile = 'v4';
 	private settings: dsp.ScaleSettings = { ...ADC_PROFILES.v4 };
 	private demoAlpha = 18;
 
 	private fs = 600;
-	// Sample rate for the ESP32 BLE source. MUST match the firmware's SAMPLE_RATE
-	// (firmware/v2 EEGData.h). The board streams one sample per notification at this rate;
-	// the PSD/band-pass are meaningless if this doesn't match the true rate.
-	private readonly BLE_FS = BLE_SAMPLE_RATE;
 	private unit: 'counts' | 'uV' = 'uV';
 	private filt: number[] = [];
 	private filtCap = 0;
@@ -90,9 +86,7 @@ export class NeuroFocus {
 	private demoTimer: ReturnType<typeof setInterval> | null = null;
 	private demoData: number[] = [];
 	private demoIdx = 0;
-	private dev: Ble = null;
-	private dataChar: Ble = null;
-	private cmdChar: Ble = null;
+	private link: NeuroLink | null = null;
 
 	// NeuroSky MindWave: the headset's Bluetooth-serial link streams raw EEG (512 Hz)
 	// continuously with no enable command — so the browser reads it directly over the
@@ -234,7 +228,9 @@ export class NeuroFocus {
 			}
 			if (now - this.lastPsd > 450 && this.filt.length > this.welchN) {
 				this.lastPsd = now;
-				const seg = this.filt.slice(-Math.min(this.filt.length, Math.round(this.fs * this.psdWindowS)));
+				const seg = this.filt.slice(
+					-Math.min(this.filt.length, Math.round(this.fs * this.psdWindowS))
+				);
 				this.psd = dsp.welch(Float64Array.from(seg), this.fs, this.welchN, this.welchOverlap);
 				this.drawPsd();
 				this.drawBands();
@@ -493,51 +489,87 @@ export class NeuroFocus {
 	}
 
 	// ---------- sources ----------
-	async connectBLE(): Promise<void> {
-		const nav = navigator as Navigator & { bluetooth?: Ble };
-		if (!nav.bluetooth) {
+	/**
+	 * Link an ESP32 NeuroFocus board over Web Bluetooth.
+	 *
+	 * `version` picks the sample rate and the counts→µV profile, and the two must agree
+	 * with the board you actually plugged in — a v4 board read with the v2 profile renders
+	 * µV ~4096x wrong and flattens the CH1 trace.
+	 */
+	async connectBLE(version: AdcProfile = 'v4'): Promise<void> {
+		if (!NeuroLink.supported) {
 			this.msg('Web Bluetooth not available — open BERGER-1 standalone in Chrome / Edge.');
 			return;
 		}
+		await this.link?.disconnect();
+		this.link = new NeuroLink({
+			onSamples: (counts) => this.ingestMany(counts, false),
+			onState: (state, detail) => {
+				if (state === 'live') this.setMode('live · ble', '#5fe886');
+				else if (state === 'reconnecting') this.setMode('re-link', '#e8a23a');
+				else if (state === 'idle' || state === 'error') this.setMode('idle', '#2a3329');
+				this.msg(detail);
+			},
+			onDiag: (d) => this.msg('DIAG ' + (d.verdict ?? '') + ' — ' + describeDiag(d)),
+			onStatusText: (line) => this.msg('device: ' + line)
+		});
+		this.stopDemo();
+		this.reset();
+		this.setFs(BLE_SAMPLE_RATE[version]);
+		this.unit = 'counts';
+		this.setAdcProfile(version);
 		try {
-			this.msg('requesting device…');
-			const dev: Ble = await nav.bluetooth.requestDevice({
-				filters: [{ services: [this.SERVICE] }],
-				optionalServices: [this.SERVICE]
-			});
-			this.dev = dev;
-			dev.addEventListener('gattserverdisconnected', () => {
-				this.setMode('idle', '#2a3329');
-				this.msg('device disconnected');
-			});
-			const server: Ble = await dev.gatt.connect();
-			const svc: Ble = await server.getPrimaryService(this.SERVICE);
-			this.dataChar = await svc.getCharacteristic(this.DATA);
-			this.cmdChar = await svc.getCharacteristic(this.CMD);
-			this.stopDemo();
-			this.reset();
-			this.setFs(this.BLE_FS);   // match the firmware's true sample rate, not the 600 default
-			this.unit = 'counts';
-			// The ESP32 v2 board streams raw 12-bit unipolar counts, so scale with the v2 profile
-			// (12-bit, mid-scale removed, discrete AFE gain) — the default v4 24-bit/bipolar
-			// profile would render µV ~4096x too small and flatten the CH1 trace.
-			this.setAdcProfile('v2');
-			await this.dataChar.startNotifications();
-			this.dataChar.addEventListener('characteristicvaluechanged', (e: Event) => this.onBle(e));
-			await this.cmdChar.writeValue(new TextEncoder().encode('b'));
-			this.setMode('live · ble', '#5fe886');
-			this.msg('linked to ' + (dev.name || 'device') + ' — streaming');
+			await this.link.connect();
 		} catch (e) {
+			this.link = null;
 			this.msg('BLE: ' + (e instanceof Error ? e.message : String(e)));
 		}
 	}
 
-	private onBle(e: Event): void {
-		const target = e.target as { value?: DataView };
-		if (!target.value) return;
-		const vals = dsp.parseFrame(new TextDecoder().decode(target.value));
-		if (!vals.length) this.ovf++;
-		this.ingestMany(vals, false);
+	/** `b` / `s` / `v` / `d` — the firmware's OpenBCI-style command set. */
+	async deviceStart(): Promise<void> {
+		await this.runCommand(() => this.link!.start(), 'streaming');
+	}
+
+	async deviceStop(): Promise<void> {
+		await this.runCommand(() => this.link!.stop(), 'stream stopped (still linked)');
+	}
+
+	async deviceReset(): Promise<void> {
+		await this.runCommand(async () => {
+			this.msg('resetting ADS1220…');
+			await this.link!.reset();
+			this.reset();
+		}, 'reset complete — streaming');
+	}
+
+	async deviceDiag(): Promise<DiagReport | null> {
+		if (!this.link?.connected) {
+			this.msg('link a device first');
+			return null;
+		}
+		this.msg('running on-device diagnostic (~1.5 s, stream pauses)…');
+		try {
+			const rep = await this.link.diag();
+			this.msg('DIAG ' + (rep.verdict ?? rep.error ?? '') + ' — ' + describeDiag(rep));
+			return rep;
+		} catch (e) {
+			this.msg('DIAG: ' + (e instanceof Error ? e.message : String(e)));
+			return null;
+		}
+	}
+
+	private async runCommand(op: () => Promise<void>, okMsg: string): Promise<void> {
+		if (!this.link?.connected) {
+			this.msg('link a device first');
+			return;
+		}
+		try {
+			await op();
+			this.msg(okMsg);
+		} catch (e) {
+			this.msg('command failed: ' + (e instanceof Error ? e.message : String(e)));
+		}
 	}
 
 	// ---------- NeuroSky MindWave (Web Serial / ThinkGear, all in-browser) ----------
@@ -719,20 +751,16 @@ export class NeuroFocus {
 	async stopAll(): Promise<void> {
 		this.stopDemo();
 		this.nsAbort = true;
-		try {
-			if (this.cmdChar) await this.cmdChar.writeValue(new TextEncoder().encode('s'));
-			if (this.dataChar) await this.dataChar.stopNotifications();
-			if (this.dev && this.dev.gatt.connected) this.dev.gatt.disconnect();
-		} catch {
-			/* ignore teardown errors */
-		}
+		// NeuroLink stops the stream and drops GATT; leaving the link up would keep the
+		// board's single central slot occupied.
+		await this.link?.disconnect();
+		this.link = null;
 		try {
 			if (this.nsReader) await this.nsReader.cancel();
 			if (this.nsPort) await this.nsPort.close();
 		} catch {
 			/* ignore teardown errors */
 		}
-		this.dataChar = this.cmdChar = this.dev = null;
 		this.nsReader = this.nsPort = null;
 		this.setMode('idle', '#2a3329');
 		this.msg('halted');
