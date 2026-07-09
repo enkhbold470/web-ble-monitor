@@ -1,21 +1,17 @@
 <script lang="ts">
-	// EZ mode — the dead-simple view. Connects to the NeuroFocus v2 headset and shows
+	// EZ mode — the dead-simple view. Connects to the NeuroFocus v4 headset and shows
 	// plain-language state (BLINK! / FOCUSED / RELAXED) instead of graphs. Reuses the same
-	// DSP + BLE contract as the main BERGER·1 app.
+	// BLE link + focus engine as /demo and the main BERGER·1 app.
 	import { onDestroy } from 'svelte';
-	import * as dsp from '$lib/dsp';
-	import {
-		ADC_PROFILES,
-		BLE_SERVICE,
-		BLE_DATA,
-		BLE_CMD,
-		BLE_SAMPLE_RATE
-	} from '$lib/neurofocus';
+	import { browser } from '$app/environment';
+	import { resolve } from '$app/paths';
+	import { ADC_PROFILES } from '$lib/adc';
+	import { NeuroLink, V4_SAMPLE_RATE } from '$lib/ble';
+	import { FocusEngine } from '$lib/focus';
 
-	/* eslint-disable @typescript-eslint/no-explicit-any */
-	type Ble = any;
-
-	const FS = BLE_SAMPLE_RATE;
+	// firmware/v4: ADS1220 at 175 SPS (DR_LVL_3), 24-bit bipolar, AD8422 in-amp ahead of it.
+	const FS = V4_SAMPLE_RATE;
+	const SCALE = ADC_PROFILES.v4;
 
 	// ---- reactive UI state ----
 	let status = $state<'idle' | 'connecting' | 'live' | 'error'>('idle');
@@ -25,76 +21,46 @@
 	let blinking = $state(false); // true briefly right after a blink -> drives the flash
 	let focus = $state(0); // 0..100 attention estimate
 	let calm = $state(0); // 0..100 relaxation (alpha) estimate
-	let mood = $state<'—' | 'FOCUSED' | 'RELAXED' | 'NEUTRAL'>('—');
+	let mood = $state<'—' | 'FOCUSED' | 'RELAXED' | 'NEUTRAL' | 'CALIBRATING'>('—');
 	let signalOk = $state(false); // is there real electrode activity at all?
-
-	// ---- processing state (non-reactive) ----
-	let dev: Ble = null;
-	let chain = dsp.makeChain(FS, { lo: 1, hi: 45, line: 60 });
-	const settings = { ...ADC_PROFILES.v2 };
-	const buf: number[] = []; // filtered µV history
-	const BUF_CAP = FS * 4; // 4 s window
-	let emaSq = 0; // slow baseline power (for adaptive blink threshold)
-	let refractory = 0; // samples remaining before another blink can fire
-	let focusEma = 0;
-	let calmEma = 0;
-	let sinceFocus = 0;
-	let blinkTimer: ReturnType<typeof setTimeout> | null = null;
-
-	// SPS meter
-	let spsCount = 0;
-	let spsT = 0;
+	let calibrating = $state(true); // focus is meaningless until the baseline is known
+	let calLeft = $state(0);
 	let spark: HTMLCanvasElement | null = $state(null);
 
-	const BLINK_K = 4.5; // blink if |y| exceeds K x baseline RMS ...
-	const BLINK_FLOOR = 12; // ... and this µV floor (so a flat/noisy line can't trigger)
-	const REFRACTORY = Math.round(0.3 * FS); // ~300 ms between blinks
+	// ---- processing state (non-reactive) ----
+	let link: NeuroLink | null = null;
+	let blinkTimer: ReturnType<typeof setTimeout> | null = null;
+	let raf = 0;
 
-	function onSample(uv: number) {
-		const y = chain.step(uv); // band-passed µV
-		buf.push(y);
-		if (buf.length > BUF_CAP) buf.shift();
-
-		// adaptive baseline (slow, so an occasional blink barely moves it)
-		emaSq = emaSq * 0.995 + y * y * 0.005;
-		const rms = Math.sqrt(emaSq);
-		signalOk = rms > 1.5; // essentially-flat line => not coupled
-
-		// blink = sharp deflection above the adaptive threshold + a floor
-		if (refractory > 0) refractory--;
-		else if (Math.abs(y) > Math.max(BLINK_FLOOR, BLINK_K * rms)) {
-			fireBlink();
-			refractory = REFRACTORY;
+	const engine = new FocusEngine(FS, {
+		line: 60,
+		onBlink: () => {
+			blinkCount++;
+			blinking = true;
+			if (blinkTimer) clearTimeout(blinkTimer);
+			blinkTimer = setTimeout(() => (blinking = false), 450);
 		}
+	});
 
-		// focus / calm from band powers, ~2x per second
-		if (++sinceFocus >= Math.round(FS / 2) && buf.length >= 128) {
-			sinceFocus = 0;
-			updateBands();
-		}
-	}
-
-	function fireBlink() {
-		blinkCount++;
-		blinking = true;
-		if (blinkTimer) clearTimeout(blinkTimer);
-		blinkTimer = setTimeout(() => (blinking = false), 450);
-	}
-
-	function updateBands() {
-		const seg = Float64Array.from(buf.slice(-Math.min(buf.length, FS * 4)));
-		const { freqs, psd } = dsp.welch(seg, FS, 128, 0.5);
-		const bp = dsp.bandPowers(freqs, psd);
-		// engagement lives in the theta/alpha/beta trio; delta is dominated by drift+blinks,
-		// gamma by noise — so score within that trio only.
-		const active = bp.theta + bp.alpha + bp.beta + 1e-9;
-		const betaFrac = bp.beta / active; // more beta -> more focused/engaged
-		const alphaFrac = bp.alpha / active; // more alpha -> more relaxed
-		focusEma = focusEma * 0.7 + betaFrac * 0.3;
-		calmEma = calmEma * 0.7 + alphaFrac * 0.3;
-		focus = Math.round(Math.min(100, focusEma * 160)); // betaFrac ~0.6 reads ~100
-		calm = Math.round(Math.min(100, calmEma * 160));
-		mood = !signalOk ? 'NEUTRAL' : focus >= 55 ? 'FOCUSED' : calm >= 55 ? 'RELAXED' : 'NEUTRAL';
+	function tick() {
+		raf = requestAnimationFrame(tick);
+		const m = engine.read();
+		focus = Math.round(m.focus);
+		calm = Math.round(m.calm);
+		signalOk = m.signalOk;
+		calibrating = m.calibrating;
+		calLeft = m.calibrationLeftSec;
+		// 50 is this user's own baseline engagement, so "focused" means meaningfully above it.
+		mood = m.calibrating
+			? 'CALIBRATING'
+			: !m.signalOk
+				? 'NEUTRAL'
+				: m.focus >= 60
+					? 'FOCUSED'
+					: m.calm >= 55
+						? 'RELAXED'
+						: 'NEUTRAL';
+		sps = link?.stats.sps ?? 0;
 		drawSpark();
 	}
 
@@ -106,92 +72,68 @@
 		const w = c.width,
 			h = c.height;
 		ctx.clearRect(0, 0, w, h);
-		const n = Math.min(buf.length, FS * 3);
-		if (n < 2) return;
-		const data = buf.slice(-n);
+		const data = engine.trace(FS * 3);
+		if (data.length < 2) return;
 		let mx = 1;
 		for (const v of data) mx = Math.max(mx, Math.abs(v));
 		mx *= 1.1;
 		ctx.strokeStyle = signalOk ? '#4cc9f0' : '#556';
 		ctx.lineWidth = 2;
 		ctx.beginPath();
-		for (let i = 0; i < n; i++) {
-			const x = (i / (n - 1)) * w;
+		for (let i = 0; i < data.length; i++) {
+			const x = (i / (data.length - 1)) * w;
 			const yy = h / 2 - (data[i] / mx) * (h / 2 - 3);
-			i === 0 ? ctx.moveTo(x, yy) : ctx.lineTo(x, yy);
+			if (i === 0) ctx.moveTo(x, yy);
+			else ctx.lineTo(x, yy);
 		}
 		ctx.stroke();
 	}
 
-	function onData(e: Event) {
-		const dv = (e.target as { value?: DataView }).value;
-		if (!dv) return;
-		const vals = dsp.parseFrame(new TextDecoder().decode(dv));
-		for (const v of vals) {
-			onSample(dsp.countsToUv(v, settings));
-			spsCount++;
-		}
-		const now = performance.now();
-		if (now - spsT >= 1000) {
-			sps = Math.round((spsCount * 1000) / (now - spsT));
-			spsCount = 0;
-			spsT = now;
-		}
-	}
-
 	async function connect() {
-		const nav = navigator as Navigator & { bluetooth?: Ble };
-		if (!nav.bluetooth) {
+		if (!NeuroLink.supported) {
 			status = 'error';
 			statusMsg = 'Web Bluetooth needs Chrome or Edge (desktop / Android).';
 			return;
 		}
-		try {
-			status = 'connecting';
-			statusMsg = 'Pick your headset…';
-			dev = await nav.bluetooth.requestDevice({
-				filters: [{ services: [BLE_SERVICE] }],
-				optionalServices: [BLE_SERVICE]
-			});
-			dev.addEventListener('gattserverdisconnected', onDisconnect);
-			statusMsg = 'Connecting…';
-			const server = await dev.gatt.connect();
-			const svc = await server.getPrimaryService(BLE_SERVICE);
-			const dataChar = await svc.getCharacteristic(BLE_DATA);
-			const cmdChar = await svc.getCharacteristic(BLE_CMD);
-			chain.reset();
-			buf.length = 0;
-			emaSq = 0;
-			spsT = performance.now();
-			await dataChar.startNotifications();
-			dataChar.addEventListener('characteristicvaluechanged', onData);
-			try {
-				await cmdChar.writeValue(new TextEncoder().encode('b')); // start streaming
-			} catch {
-				/* streaming auto-starts on connect anyway */
+		engine.reset();
+		blinkCount = 0;
+		link = new NeuroLink({
+			onSamples: (counts) => engine.pushCounts(counts, SCALE),
+			onState: (s, detail) => {
+				statusMsg = detail;
+				status =
+					s === 'live' ? 'live' : s === 'error' ? 'error' : s === 'idle' ? 'idle' : 'connecting';
+				if (s !== 'live') signalOk = false;
 			}
-			status = 'live';
-			statusMsg = 'Connected — ' + (dev.name || 'headset');
-		} catch (err) {
+		});
+		try {
+			await link.connect();
+			if (!raf) tick();
+		} catch (e) {
+			// NeuroLink already turned the raw GATT error into something actionable.
 			status = 'error';
-			statusMsg = err instanceof Error ? err.message : String(err);
+			statusMsg = e instanceof Error ? e.message : String(e);
+			link = null;
 		}
 	}
 
-	function onDisconnect() {
+	async function disconnect() {
+		cancelAnimationFrame(raf);
+		raf = 0;
+		await link?.disconnect();
+		link = null;
 		status = 'idle';
 		statusMsg = 'Disconnected';
 		signalOk = false;
 		mood = '—';
 	}
 
-	function disconnect() {
-		if (dev?.gatt?.connected) dev.gatt.disconnect();
-	}
-
 	onDestroy(() => {
+		// onDestroy also runs during SSR, where there is no rAF.
+		if (!browser) return;
 		if (blinkTimer) clearTimeout(blinkTimer);
-		disconnect();
+		cancelAnimationFrame(raf);
+		void disconnect();
 	});
 </script>
 
@@ -200,7 +142,10 @@
 <main class:flash={blinking}>
 	<header>
 		<span class="brand">NeuroFocus <b>EZ</b></span>
-		<a class="full" href="/">full view →</a>
+		<nav>
+			<a class="full" href={resolve('/demo')}>demo →</a>
+			<a class="full" href={resolve('/')}>full view →</a>
+		</nav>
 	</header>
 
 	{#if status !== 'live'}
@@ -227,12 +172,19 @@
 				{mood}
 			</div>
 
+			{#if calibrating}
+				<p class="note" style="margin-top:0">
+					Learning your baseline — sit normally for another {calLeft.toFixed(0)}s. Focus is scored
+					against <b>you</b>, not against other people.
+				</p>
+			{/if}
+
 			<!-- two simple meters -->
 			<div class="meters">
 				<div class="meter">
 					<span class="lbl">FOCUS</span>
-					<div class="bar"><i style="width:{focus}%" class="fill focus"></i></div>
-					<span class="pct">{focus}</span>
+					<div class="bar"><i style="width:{calibrating ? 0 : focus}%" class="fill focus"></i></div>
+					<span class="pct">{calibrating ? '—' : focus}</span>
 				</div>
 				<div class="meter">
 					<span class="lbl">CALM</span>
@@ -269,7 +221,12 @@
 		background: #0a0d14;
 		color: #e8eef6;
 		font-family:
-			ui-rounded, 'SF Pro Rounded', system-ui, -apple-system, Segoe UI, sans-serif;
+			ui-rounded,
+			'SF Pro Rounded',
+			system-ui,
+			-apple-system,
+			Segoe UI,
+			sans-serif;
 		transition: background 0.12s ease;
 	}
 	main.flash {
@@ -283,6 +240,10 @@
 		align-items: center;
 		padding: 18px 22px;
 		box-sizing: border-box;
+	}
+	nav {
+		display: flex;
+		gap: 16px;
 	}
 	.brand {
 		letter-spacing: 0.5px;
@@ -329,6 +290,8 @@
 		margin-top: 18px;
 		color: #7c8ca0;
 		min-height: 1.2em;
+		max-width: 460px;
+		line-height: 1.5;
 	}
 	.msg.err {
 		color: #ff8a8a;

@@ -1,9 +1,11 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { resolve } from '$app/paths';
 	import { NeuroFocus, type AdcProfile } from '$lib/neurofocus';
 
 	let app: NeuroFocus | undefined;
 	// Active ADC scaling profile: v2 = ESP32-C3 12-bit unipolar, v4 = ADS1220 24-bit bipolar.
+	// This also picks the sample rate on connect, so it must match the board in your hand.
 	let adc = $state<AdcProfile>('v4');
 
 	function setAdc(p: AdcProfile): void {
@@ -11,10 +13,8 @@
 		app?.setAdcProfile(p);
 	}
 
-	// The ESP32 v2 board forces the 12-bit profile on connect — keep the toggle in sync.
 	function connectEsp32(): void {
-		adc = 'v2';
-		void app?.connectBLE();
+		void app?.connectBLE(adc);
 	}
 
 	onMount(() => {
@@ -296,7 +296,12 @@
 				<div style="display:flex;gap:8px">
 					<button class="nf-btn nf-src" onclick={() => app?.startDemo()}>◊ Test</button>
 					<button class="nf-btn nf-src nf-neutral" onclick={() => app?.openFile()}>▤ File</button>
-					<button class="nf-btn nf-src" onclick={() => connectEsp32()}>∿ ESP32</button>
+					<button
+						class="nf-btn nf-src"
+						onclick={() => connectEsp32()}
+						title="Link the ESP32 board over Web Bluetooth using the selected ADC profile"
+						>∿ ESP32 · {adc.toUpperCase()}</button
+					>
 					<button class="nf-btn nf-src" onclick={() => app?.connectNeuroSky()}>∿ NeuroSky</button>
 					<button
 						class="nf-btn nf-src nf-disabled"
@@ -306,9 +311,48 @@
 					<button class="nf-btn nf-src nf-stop" onclick={() => app?.stopAll()}>■ Stop</button>
 				</div>
 				<span style="font:500 9px 'Space Mono',monospace;letter-spacing:.3px;color:#8a8068"
-					>NeuroSky → pair the MindWave, then click NeuroSky and pick its serial port (<b
-						style="color:#6a6149">MindWaveMobile</b
+					>ESP32 → pick the profile matching your board (V4 = ADS1220 @ 175 SPS). NeuroSky → pair
+					the MindWave, then click NeuroSky and pick its serial port (<b style="color:#6a6149"
+						>MindWaveMobile</b
 					>). Chrome / Edge desktop · no app needed.</span
+				>
+			</div>
+
+			<!-- DEVICE COMMANDS — the firmware's OpenBCI-style byte commands (config.h CMD_*) -->
+			<div
+				style="display:flex;flex-direction:column;gap:7px;padding:8px 12px;border-radius:9px;background:rgba(0,0,0,.045);box-shadow:inset 0 1px 2px rgba(0,0,0,.08),0 1px 0 rgba(255,255,255,.4)"
+			>
+				<span
+					style="font:600 9px 'Saira Condensed';letter-spacing:3px;color:#6a6149;text-shadow:0 1px 0 rgba(255,255,255,.5)"
+					>DEVICE · ESP32 COMMANDS</span
+				>
+				<div style="display:flex;gap:8px">
+					<button
+						class="nf-btn nf-src"
+						title="b — start streaming"
+						onclick={() => app?.deviceStart()}>▶ Start</button
+					>
+					<button
+						class="nf-btn nf-src nf-neutral"
+						title="s — stop streaming (stays linked)"
+						onclick={() => app?.deviceStop()}>⏸ Stop</button
+					>
+					<button
+						class="nf-btn nf-src nf-neutral"
+						title="v — re-init the ADS1220, then resume streaming"
+						onclick={() => app?.deviceReset()}>↺ Reset</button
+					>
+					<button
+						class="nf-btn nf-src"
+						title="d — on-device signal diagnostic (~1.5 s, stream pauses)"
+						onclick={() => app?.deviceDiag()}>⚕ Diag</button
+					>
+				</div>
+				<span style="font:500 9px 'Space Mono',monospace;letter-spacing:.3px;color:#8a8068"
+					>Diag checks rail / DC / RMS / mains-vs-alpha on the board itself. <a
+						href={resolve('/demo')}
+						style="color:#c8642a;font-weight:700">Game demo →</a
+					></span
 				>
 			</div>
 
