@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { mulberry32 } from './game';
 import {
 	DEATH_MASK_SEC,
 	LAG_SEC,
@@ -137,14 +138,17 @@ describe('analyzeDeaths — the statistic', () => {
 		expect(r.verdict).toBe('association');
 	});
 
-	it('finds nothing when focus is flat — no false positive', () => {
+	it('finds nothing when focus is flat', () => {
+		// Degenerate by construction: with constant focus every null draw has delta 0, so p is
+		// exactly 1 and this can never fail. It is NOT a Type-I check — see the calibration
+		// suite below, which is what actually guards the null.
 		const r = analyzeDeaths(
 			track(120, () => 55),
 			deaths
 		);
 		expect(r.verdict).toBe('no-association');
 		expect(Math.abs(r.delta)).toBeLessThan(1);
-		expect(r.p!).toBeGreaterThan(0.05);
+		expect(r.p!).toBe(1);
 	});
 
 	it('excludes peri-death samples from the baseline, so the dip is not diluted', () => {
@@ -173,6 +177,84 @@ describe('analyzeDeaths — the statistic', () => {
 		);
 		const r = analyzeDeaths(s, deaths);
 		expect(r.verdict).toBe('association');
+	});
+});
+
+describe('analyzeDeaths — Type-I calibration (the test that catches a bad null)', () => {
+	/**
+	 * Focus as AR(1) noise plus a linear drift — an honest model of a real trace, which is
+	 * autocorrelated and nonstationary (vigilance decrement). Deaths are generated with NO
+	 * knowledge of it, so the true null hypothesis holds by construction: any "association"
+	 * is a false positive.
+	 */
+	function nullSession(seed: number, opts: { clustered: boolean; driftPerMin: number }) {
+		const rnd = mulberry32(seed);
+		const DUR = 180;
+		const samples: FocusSample[] = [];
+		let x = 0;
+		for (let i = 0; i < DUR * RATE; i++) {
+			const t = i / RATE;
+			// phi = 0.97 at 4 Hz => a correlation time of a few seconds, like the real engine.
+			x = 0.97 * x + (rnd() * 2 - 1) * 3;
+			const focus = 55 + x + (opts.driftPerMin * t) / 60;
+			samples.push({ t, focus, calm: 20, signalOk: true, calibrating: false });
+		}
+		// Deaths, independent of focus. Clustered = the auto-runner regime: several deaths at
+		// one hard stretch, spaced just wide enough to clear the contamination guard.
+		const deathTimes: number[] = [];
+		if (opts.clustered) {
+			const start = 30 + rnd() * (DUR - 90);
+			for (let k = 0; k < 5; k++) deathTimes.push(start + k * 11);
+		} else {
+			for (let k = 0; k < 5; k++) deathTimes.push(20 + k * 30);
+		}
+		return { samples, deathTimes };
+	}
+
+	/** Share of sessions where the test cries "association" under a true null. */
+	function falsePositiveRate(opts: { clustered: boolean; driftPerMin: number }, trials = 60) {
+		let fired = 0;
+		let tested = 0;
+		for (let seed = 1; seed <= trials; seed++) {
+			const { samples, deathTimes } = nullSession(seed, opts);
+			const r = analyzeDeaths(samples, deathTimes);
+			if (r.p === null) continue; // not tested; does not count either way
+			tested++;
+			if (r.verdict === 'association') fired++;
+		}
+		return { rate: tested ? fired / tested : 0, tested };
+	}
+
+	it('holds its nominal 5% on CLUSTERED deaths with drift — the regime a uniform null breaks', () => {
+		// This is the case the old uniform-window null failed: it fired on ~27% of sessions.
+		const { rate, tested } = falsePositiveRate({ clustered: true, driftPerMin: 6 });
+		expect(tested).toBeGreaterThan(30); // the scenario really does run the test
+		expect(rate).toBeLessThan(0.15);
+	});
+
+	it('holds on clustered deaths without drift', () => {
+		const { rate, tested } = falsePositiveRate({ clustered: true, driftPerMin: 0 });
+		expect(tested).toBeGreaterThan(30);
+		expect(rate).toBeLessThan(0.15);
+	});
+
+	it('holds on well-separated deaths with drift', () => {
+		const { rate, tested } = falsePositiveRate({ clustered: false, driftPerMin: 6 });
+		expect(tested).toBeGreaterThan(30);
+		expect(rate).toBeLessThan(0.15);
+	});
+
+	it('still has power: a real dip is detected on top of the same noisy, drifting trace', () => {
+		const { samples, deathTimes } = nullSession(7, { clustered: false, driftPerMin: 6 });
+		// Inject a genuine 30-point sag into each pre-death window.
+		for (const s of samples) {
+			for (const d of deathTimes) {
+				if (s.t >= d - LAG_SEC - PRE_WINDOW_SEC && s.t < d - LAG_SEC) s.focus -= 30;
+			}
+		}
+		const r = analyzeDeaths(samples, deathTimes);
+		expect(r.verdict).toBe('association');
+		expect(r.delta).toBeLessThan(-15);
 	});
 });
 

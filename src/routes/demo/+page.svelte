@@ -120,6 +120,8 @@
 	let lastSampleAt = 0;
 	let focusSamples: FocusSample[] = [];
 	let deathTimes: number[] = [];
+	/** Engine blinks are cumulative; the report wants this session's, so snapshot the offset. */
+	let blinksAtSessionStart = 0;
 
 	// ---------- sources ----------
 	async function useHeadset() {
@@ -201,9 +203,19 @@
 		statusMsg = 'Stopped.';
 	}
 
-	function rebuildEngine() {
-		engine = new FocusEngine(fs, { line: mains });
+	/**
+	 * Rebuild the DSP chain (rate or notch changed, or the board was reset).
+	 *
+	 * `keepBaseline` carries the calibration across. A `v` reset re-inits the ADC but does not
+	 * change the person wearing it, so forcing another 20 s of calibration mid-session would
+	 * be pure friction. A rate or notch change DOES move the band powers, so the old baseline
+	 * engagement is no longer comparable and must be discarded.
+	 */
+	function rebuildEngine(keepBaseline = false) {
+		const baseline = keepBaseline ? (engine.read().baseline ?? undefined) : undefined;
+		engine = new FocusEngine(fs, { line: mains, baselineEngagement: baseline });
 		blinks = 0;
+		blinksAtSessionStart = 0;
 		totalSamples = 0;
 		dropped = 0;
 		diagReport = null;
@@ -212,7 +224,7 @@
 	function setMains(f: 50 | 60) {
 		if (mains === f) return;
 		mains = f;
-		rebuildEngine(); // the notch is baked into the filter chain
+		rebuildEngine(); // the notch is baked into the chain, so the baseline no longer applies
 	}
 
 	// ---------- synthetic EEG (practice) ----------
@@ -269,7 +281,7 @@
 	const cmdReset = () =>
 		runCommand('ADS1220 re-initialised (v), streaming again.', async () => {
 			await link!.reset();
-			rebuildEngine();
+			rebuildEngine(true); // same head, same baseline — don't force a recalibration
 		});
 	const cmdInfo = () =>
 		runCommand('Asked the board to describe itself (i).', async () => {
@@ -310,6 +322,7 @@
 		sessionSec = 0;
 		deaths = 0;
 		finished = false;
+		blinksAtSessionStart = engine.read().blinks;
 		playing = true;
 	}
 
@@ -321,7 +334,8 @@
 			deathTimes,
 			attempts: game.attempt,
 			bestProgress: game.bestProgress,
-			blinks: engine.read().blinks
+			// Blinks accrued during THIS session, not since the engine was built.
+			blinks: Math.max(0, engine.read().blinks - blinksAtSessionStart)
 		});
 		drawTimeline();
 	}
@@ -644,10 +658,12 @@
 
 	// ---------- input ----------
 	function onKeyDown(e: KeyboardEvent) {
-		if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
-			if (playing) e.preventDefault();
-			queueJump();
-		}
+		if (e.code !== 'Space' && e.code !== 'ArrowUp' && e.code !== 'KeyW') return;
+		if (playing) e.preventDefault();
+		// The OS fires keydown repeatedly while a key is held. Honouring those would turn a
+		// held key into an autojump, which the fixed-timestep jump model deliberately is not.
+		if (e.repeat) return;
+		queueJump();
 	}
 
 	onMount(() => {

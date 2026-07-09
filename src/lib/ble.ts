@@ -38,9 +38,12 @@ export const CMD = {
 export type Command = (typeof CMD)[keyof typeof CMD];
 
 /**
- * True ADS1220 output rate. `ads1220_driver.cpp` calls `setDataRate(ADS1220_DR_LVL_3)`
- * = 175 SPS, even though config.h/docs claim 600 (firmware/v4/CLAUDE.md documents the
- * mismatch). Feed this to the DSP — a wrong fs slides every frequency by the same ratio.
+ * FALLBACK ADS1220 output rate, for boards older than firmware v4.1.
+ *
+ * Prefer the rate the board reports: `NeuroLink` sends `i` on connect and exposes the reply
+ * as `link.deviceInfo.sps`. Firmware v4.1 pins this to 175 SPS with a `static_assert`
+ * (`config.h ADS1220_SAMPLE_RATE_HZ`, `setDataRate(ADS1220_DR_LVL_3)`); older builds
+ * documented 600 while running at 175. A wrong fs slides every frequency by the same ratio.
  */
 export const V4_SAMPLE_RATE = 175;
 /** firmware/v2 EEGData.h SAMPLE_RATE — one sample per notification. */

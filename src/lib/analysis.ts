@@ -20,10 +20,13 @@
 //    a guard interval after EVERY death, globally, and discard any pre-death window that
 //    overlaps another death's mask. Windows that survive are the only ones we use.
 //
-// 4. **Autocorrelation.** Focus is sampled at 4 Hz over a 3 s analysis window, so adjacent
-//    samples share ~90% of their data. A per-sample t-test over them manufactures
-//    significance from nothing. The null distribution is therefore built by resampling whole
-//    windows (block permutation), not samples.
+// 4. **Autocorrelation, and the clustering that comes with it.** Focus is sampled at 4 Hz
+//    over a 3 s analysis window, so adjacent samples share ~90% of their data; a per-sample
+//    t-test over them manufactures significance from nothing. But resampling whole windows
+//    uniformly is *also* wrong, and wrong in the dangerous direction: the real windows are
+//    clustered while uniform ones are not, so the null comes out too narrow. The null instead
+//    **circularly rotates the whole death pattern** and rebuilds the statistic with the same
+//    rule, preserving clustering, spacing and autocorrelation. See `analyzeDeaths`.
 //
 // 5. **Forking paths.** The window length, the lag, and the mask are FIXED constants below.
 //    They are not tuned per session, and no alternative is tried and then reported.
@@ -104,6 +107,11 @@ export interface SessionReport {
 }
 
 const usable = (s: FocusSample): boolean => s.signalOk && !s.calibrating;
+/** A window must cover at least this fraction of its nominal span to be a measurement. */
+const MIN_WINDOW_COVERAGE = 0.7;
+const MIN_WINDOW_SAMPLES = 6;
+/** Below this many valid permutations we decline to quote a p-value. */
+const MIN_DRAWS = 200;
 
 function mean(xs: number[]): number {
 	if (!xs.length) return 0;
@@ -112,15 +120,72 @@ function mean(xs: number[]): number {
 	return a / xs.length;
 }
 
-/** Mean focus of every usable sample in [a, b). Null when the window has no usable data. */
-function windowMean(samples: FocusSample[], a: number, b: number): number | null {
-	const xs: number[] = [];
-	for (const s of samples) {
-		if (s.t >= a && s.t < b && usable(s)) xs.push(s.focus);
+/**
+ * Usable samples only, with prefix sums, so a window mean or a masked baseline is a couple
+ * of binary searches rather than a scan. The permutation loop runs this thousands of times.
+ */
+class UsableTrack {
+	readonly t: number[] = [];
+	readonly f: number[] = [];
+	/** prefix[i] = sum of f[0..i-1] */
+	private readonly prefix: number[] = [0];
+
+	constructor(samples: FocusSample[]) {
+		for (const s of samples) {
+			if (!usable(s)) continue;
+			this.t.push(s.t);
+			this.f.push(s.focus);
+			this.prefix.push(this.prefix[this.prefix.length - 1] + s.focus);
+		}
 	}
-	// Demand most of the window: a couple of stray samples is not a measurement.
-	// At 4 Hz a 4 s window holds ~16 samples.
-	return xs.length >= 6 ? mean(xs) : null;
+
+	get length(): number {
+		return this.t.length;
+	}
+
+	/** First index with t[i] >= x. */
+	private lowerBound(x: number): number {
+		let lo = 0;
+		let hi = this.t.length;
+		while (lo < hi) {
+			const mid = (lo + hi) >> 1;
+			if (this.t[mid] < x) lo = mid + 1;
+			else hi = mid;
+		}
+		return lo;
+	}
+
+	sumCount(a: number, b: number): { sum: number; count: number; lo: number; hi: number } {
+		const lo = this.lowerBound(a);
+		const hi = this.lowerBound(b);
+		return { sum: this.prefix[hi] - this.prefix[lo], count: hi - lo, lo, hi };
+	}
+
+	/**
+	 * Mean focus over [a, b), or null when the window is not actually covered — too few
+	 * samples, or the samples present only span a sliver of it because a signal dropout or a
+	 * peri-death excision punched a hole through the middle. Accepting those would let the
+	 * null draw "windows" the observed side could never produce.
+	 */
+	windowMean(a: number, b: number): number | null {
+		const { sum, count, lo, hi } = this.sumCount(a, b);
+		if (count < MIN_WINDOW_SAMPLES) return null;
+		const span = this.t[hi - 1] - this.t[lo];
+		if (span < MIN_WINDOW_COVERAGE * (b - a)) return null;
+		return sum / count;
+	}
+
+	/** Mean over every usable sample NOT inside one of the (sorted, merged) intervals. */
+	meanOutside(intervals: [number, number][]): { mean: number; count: number } {
+		let sum = this.prefix[this.prefix.length - 1];
+		let count = this.t.length;
+		for (const [a, b] of intervals) {
+			const r = this.sumCount(a, b);
+			sum -= r.sum;
+			count -= r.count;
+		}
+		return { mean: count > 0 ? sum / count : 0, count };
+	}
 }
 
 /** True if any death other than `exclude` sits close enough to poison [a, b). */
@@ -134,23 +199,79 @@ function contaminated(deathTimes: number[], a: number, b: number, exclude: numbe
 	return false;
 }
 
-/** Is `t` within any death's neighbourhood — either its pre-window or its aftermath mask? */
-function periDeath(deathTimes: number[], t: number): boolean {
-	for (const d of deathTimes) {
-		if (t >= d - LAG_SEC - PRE_WINDOW_SEC && t <= d + DEATH_MASK_SEC) return true;
+/** Merged neighbourhood of every death: its pre-window plus its aftermath mask. */
+function periDeathIntervals(deathTimes: number[]): [number, number][] {
+	const raw: [number, number][] = deathTimes
+		.map((d): [number, number] => [d - LAG_SEC - PRE_WINDOW_SEC, d + DEATH_MASK_SEC])
+		.sort((x, y) => x[0] - y[0]);
+	const out: [number, number][] = [];
+	for (const iv of raw) {
+		const last = out[out.length - 1];
+		if (last && iv[0] <= last[1]) last[1] = Math.max(last[1], iv[1]);
+		else out.push([...iv]);
 	}
-	return false;
+	return out;
+}
+
+interface Statistic {
+	preMeans: number[];
+	baselineMean: number;
+	baselineCount: number;
+	delta: number;
+}
+
+/**
+ * The whole statistic, from one set of death times. Used for BOTH the observed value and
+ * every permutation, so the null cannot be built by a different rule than the thing it is
+ * supposed to be a null for.
+ */
+function statisticFor(track: UsableTrack, deathSet: number[], tEnd: number): Statistic {
+	const preMeans: number[] = [];
+	for (const d of deathSet) {
+		const b = d - LAG_SEC;
+		const a = b - PRE_WINDOW_SEC;
+		if (a < 0 || b > tEnd) continue; // window runs off an end of the session
+		if (contaminated(deathSet, a, b, d)) continue;
+		const m = track.windowMean(a, b);
+		if (m !== null) preMeans.push(m);
+	}
+	const { mean: baselineMean, count: baselineCount } = track.meanOutside(
+		periDeathIntervals(deathSet)
+	);
+	return {
+		preMeans,
+		baselineMean,
+		baselineCount,
+		delta: preMeans.length ? mean(preMeans) - baselineMean : 0
+	};
 }
 
 /**
  * Compare focus in the clean pre-death windows against a peri-death-excluded baseline.
  *
- * The baseline deliberately excludes every death's neighbourhood. Including it would put
- * the pre-death samples on both sides of the comparison and dilute the contrast toward zero.
+ * The baseline excludes every death's neighbourhood. Including it would put the pre-death
+ * samples on both sides of the comparison and dilute the contrast toward zero.
  *
- * The null distribution resamples whole windows of the same length from the clean baseline
- * region, so it inherits the same autocorrelation as the real windows. p is the fraction of
- * null deltas at least as extreme (in absolute value) as the observed one.
+ * ## Why the null rotates the deaths instead of sampling windows at random
+ *
+ * The obvious null — scatter `n` windows uniformly across the session — is **wrong here, and
+ * wrong in the anti-conservative direction.** Real deaths cluster (an auto-runner restarts
+ * you into the same hard stretch), so the observed windows sit inside one short epoch and
+ * their means are strongly correlated: averaging `n` of them barely reduces variance. Uniform
+ * null windows are spread over the whole session, so their average *does* shrink by ~sqrt(n),
+ * and it hugs the global baseline far more tightly than a clustered draw ever would. Focus is
+ * also nonstationary (this module measures the drift itself, `focusTrendPerMin`), so a
+ * clustered set of windows carries a local-epoch offset that the uniform null can never
+ * reproduce. The null ends up too narrow, the observed delta clears it too easily, and p comes
+ * out too small. Simulated on synthetic AR(1)+drift focus with deaths generated INDEPENDENTLY
+ * of it, that construction fired "association" on ~27% of sessions at a nominal 5%.
+ *
+ * So instead we **circularly rotate the entire death pattern** by a random offset and rebuild
+ * the statistic with the identical rule (`statisticFor`). Rotation preserves the spacing and
+ * clustering of the deaths, preserves the window construction, and preserves the
+ * autocorrelation of the focus track — it only breaks the alignment between deaths and focus,
+ * which is exactly the null hypothesis. A draw is kept only when it yields the same number of
+ * clean windows as the observed statistic, so like is compared with like.
  */
 export function analyzeDeaths(samples: FocusSample[], deathTimes: number[]): DeathAnalysis {
 	const empty: DeathAnalysis = {
@@ -162,56 +283,38 @@ export function analyzeDeaths(samples: FocusSample[], deathTimes: number[]): Dea
 		delta: 0,
 		p: null
 	};
-	if (!samples.length) return empty;
+	if (!samples.length || !deathTimes.length) return empty;
 
-	// 1. Clean pre-death windows.
-	const preMeans: number[] = [];
-	for (const d of deathTimes) {
-		const b = d - LAG_SEC;
-		const a = b - PRE_WINDOW_SEC;
-		if (a < 0) continue; // window runs off the start of the session
-		if (contaminated(deathTimes, a, b, d)) continue;
-		const m = windowMean(samples, a, b);
-		if (m !== null) preMeans.push(m);
+	const track = new UsableTrack(samples);
+	const tEnd = samples[samples.length - 1].t;
+	const observed = statisticFor(track, deathTimes, tEnd);
+	const n = observed.preMeans.length;
+
+	if (n < MIN_CLEAN_DEATHS || observed.baselineCount < 20) {
+		return { ...empty, cleanWindows: n, baselineMean: observed.baselineMean };
 	}
 
-	// 2. Baseline from everything outside any death's neighbourhood.
-	const baselineSamples = samples.filter((s) => usable(s) && !periDeath(deathTimes, s.t));
-	const baselineMean = mean(baselineSamples.map((s) => s.focus));
+	const preDeathMean = mean(observed.preMeans);
+	const delta = observed.delta;
 
-	if (preMeans.length < MIN_CLEAN_DEATHS || baselineSamples.length < 20) {
-		return { ...empty, cleanWindows: preMeans.length, baselineMean };
-	}
-
-	const preDeathMean = mean(preMeans);
-	const delta = preDeathMean - baselineMean;
-
-	// 3. Block-permutation null: draw `n` random windows from the clean region.
-	const tMin = baselineSamples[0].t;
-	const tMax = baselineSamples[baselineSamples.length - 1].t;
-	const span = tMax - tMin - PRE_WINDOW_SEC;
+	// Rotation null. Same rule, same geometry, only the alignment is destroyed.
 	let p: number | null = null;
-	if (span > PRE_WINDOW_SEC) {
+	if (tEnd > 2 * (PRE_WINDOW_SEC + LAG_SEC)) {
 		const rnd = mulberry32(PERMUTATION_SEED);
-		const n = preMeans.length;
 		let atLeastAsExtreme = 0;
 		let draws = 0;
-		for (let iter = 0; iter < PERMUTATIONS; iter++) {
-			const ms: number[] = [];
-			// Bounded attempts so a session with few clean stretches cannot spin forever.
-			for (let tries = 0; ms.length < n && tries < 40; tries++) {
-				const a = tMin + rnd() * span;
-				const b = a + PRE_WINDOW_SEC;
-				if (contaminated(deathTimes, a, b, NaN)) continue;
-				const m = windowMean(baselineSamples, a, b);
-				if (m !== null) ms.push(m);
-			}
-			if (ms.length < n) continue;
+		for (let iter = 0; iter < PERMUTATIONS && draws < PERMUTATIONS; iter++) {
+			const shift = rnd() * tEnd;
+			const rotated = deathTimes.map((d) => (d + shift) % tEnd);
+			const s = statisticFor(track, rotated, tEnd);
+			// Compare like with like: a rotation that loses windows off the session edge, or
+			// that leaves too little baseline, is not a valid replicate of this session.
+			if (s.preMeans.length !== n || s.baselineCount < 20) continue;
 			draws++;
-			if (Math.abs(mean(ms) - baselineMean) >= Math.abs(delta)) atLeastAsExtreme++;
+			if (Math.abs(s.delta) >= Math.abs(delta)) atLeastAsExtreme++;
 		}
 		// Add-one smoothing: p is never exactly 0 from a finite permutation set.
-		if (draws >= 200) p = (atLeastAsExtreme + 1) / (draws + 1);
+		if (draws >= MIN_DRAWS) p = (atLeastAsExtreme + 1) / (draws + 1);
 	}
 
 	const verdict: Verdict =
@@ -219,9 +322,9 @@ export function analyzeDeaths(samples: FocusSample[], deathTimes: number[]): Dea
 	return {
 		verdict,
 		deaths: deathTimes.length,
-		cleanWindows: preMeans.length,
+		cleanWindows: n,
 		preDeathMean,
-		baselineMean,
+		baselineMean: observed.baselineMean,
 		delta,
 		p
 	};
@@ -318,11 +421,12 @@ export function verdictText(d: DeathAnalysis): string {
 	const p = d.p!.toFixed(3);
 	if (d.verdict === 'association') {
 		return (
-			`In this session your focus ran ${mag} points ${dir} in the ${PRE_WINDOW_SEC} s before a ` +
-			`death than the rest of the time (${d.preDeathMean.toFixed(1)} vs ` +
-			`${d.baselineMean.toFixed(1)}, n=${d.cleanWindows}, p=${p}). That is a within-session ` +
-			'association, not proof that losing focus caused the crashes — a hard stretch of the ' +
-			'level can lower focus and kill you independently.'
+			`In this session your focus ran ${mag} points ${dir} during the ${PRE_WINDOW_SEC} s ` +
+			`window ending ${LAG_SEC} s before each death than the rest of the time ` +
+			`(${d.preDeathMean.toFixed(1)} vs ${d.baselineMean.toFixed(1)}, n=${d.cleanWindows}, ` +
+			`p=${p}). That is a within-session association from ${d.cleanWindows} windows, not ` +
+			'proof that losing focus caused the crashes — a hard stretch of the level can lower ' +
+			'focus and kill you independently.'
 		);
 	}
 	return (
