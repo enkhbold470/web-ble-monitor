@@ -31,9 +31,6 @@ One ingest path feeds every source into shared DSP, then a rAF loop draws.
   radix-2 FFT, `welch()` PSD, `bandPowers()`, `stftColumn()`, `peakFreq()`,
   ASCII frame/capture parsers, synthetic signal generator. Mirrors the Python
   `eeg_process_segment.py` pipeline. Unit-tested in `dsp.test.ts`.
-- **`src/lib/thinkgear.ts`** — `ThinkGearParser`: streaming NeuroSky TGAM byte
-  parser (sync `0xAA 0xAA`, checksum, `0x80` raw / `0x02/0x04/0x05` eSense).
-  Tolerates split chunks, garbage, bad checksums. Unit-tested in `thinkgear.test.ts`.
 - **`src/lib/ble.ts`** — the ESP32 link: GATT contract, `decodeFrame()` (all three
   firmware wire formats), `parseDiag()`, and `NeuroLink` (retrying connect,
   auto-reconnect, serialised GATT ops, drop accounting). Unit-tested in `ble.test.ts`.
@@ -46,7 +43,20 @@ One ingest path feeds every source into shared DSP, then a rAF loop draws.
   **per-user baseline** measured over the first 20 s and then **frozen** (a rolling baseline
   would drag the score back to 50 forever). 50 == your own baseline; the number is not
   comparable between people. Two chains run over the same samples: 1–45 Hz for rhythms,
-  0.5–6 Hz for blinks. Unit-tested in `focus.test.ts`.
+  0.5–6 Hz for blinks. Also exports **`focusFeasibility(fs, line)`** — see the sample-rate
+  section below; the engine refuses to calibrate or score when it returns `ok: false`.
+  Unit-tested in `focus.test.ts`.
+- **`src/lib/scope.ts`** — pure scope math: `minMaxDecimate` (one `[min,max]` per pixel
+  column, so a 2000 SPS trace stays readable instead of overplotting 8000 vertices),
+  `autosetUvPerDiv`, `autoEnvelope`. Unit-tested in `scope.test.ts`.
+- **`src/lib/berger.ts`** — `BergerProtocol`: the guided eyes-open/closed alpha test.
+  Sample-clocked (never a wall clock, so it is deterministic and testable). 3 blocks ×
+  20 s open / 20 s closed, first 2 s of each epoch discarded, 2 s sub-epochs rejected on
+  peak-to-peak or RMS-floor artifact, alpha averaged per condition. Verdict is by
+  **cross-block consistency**, not a hardcoded ratio — an around-ear electrode is far from
+  the occipital alpha generator, so the textbook 2–5× does not apply. Unit-tested.
+- **`src/lib/explainers.ts` + `InfoPopover.svelte`** — the ⓘ popovers on each panel. Copy
+  is a scientific claim: keep it true, keep the caveats.
 - **`src/lib/game.ts`** — DASH: a deterministic Geometry-Dash-style runner (seeded level,
   fixed 1/120 s timestep). Pure and testable; never driven off a raw rAF delta.
 - **`src/lib/analysis.ts`** — post-session stats, including the headline "did focus sag
@@ -67,12 +77,16 @@ One ingest path feeds every source into shared DSP, then a rAF loop draws.
 - **`src/routes/ez/+page.svelte`** — `/ez`: plain-language blink + focus/calm view.
 
 ### Signal sources (all funnel into `ingest()`)
-- **Test** — synthetic 10 Hz alpha demo (in-app, no hardware). Runs on mount.
+- **Test** — synthetic 10 Hz alpha demo (in-app, no hardware). Runs on mount at 600 Hz.
 - **File** — load a capture JSON.
 - **ESP32 BLE** (`connectBLE(version)`) — firmware v4 (or v2) over Web Bluetooth/GATT.
   `version` picks BOTH the sample rate and the ADC profile; they must match the board.
-- **NeuroSky** (`connectNeuroSky`) — see below.
-- **Emotiv** — stub ("coming soon"; raw EEG needs the paid Cortex API).
+
+NeuroSky and the Emotiv stub were **removed on 2026-07-09** (`thinkgear.ts`,
+`connectNeuroSky`, `connectEmotiv`, ~300 lines). The historical design record is in
+`docs/superpowers/specs/2026-06-26-neurosky-emotiv-sources-design.md`; the working parser
+is in git history. Don't re-add them without a reason — the dead ends are documented in the
+workspace `CLAUDE.md`.
 
 ## What the focus number is worth (do not oversell it)
 
@@ -131,33 +145,32 @@ Source of truth is `../neurofocus/firmware/v4/src/` — derive from it, never gu
 - A too-small ATT MTU silently truncates a 37-byte frame. `decodeFrame()` trusts the byte
   count over the declared `n` and flags `truncated`; the `/demo` chips surface it.
 
-## NeuroSky — the hard-won truth (read before touching it)
+## Sample rate and mains — where the focus score is and isn't defensible
 
-The path went through several dead ends; the **current, correct** design is
-**in-browser Web Serial**, no extra apps:
+The mains notch **already defaults to 60 Hz** everywhere (`adc.ts` `line: 60`, `focus.ts`
+`line ?? 60`, `/demo` `DEFAULT_MAINS = 60`). North America. Do not "fix" it to 50.
 
-- The MindWave streams raw `0x80` EEG continuously over its **Bluetooth-serial
-  (RFCOMM/SPP)** link with **no enable command** — confirmed via brainbang/mindwave,
-  pymindwave2, and the NF-ios project. `connectNeuroSky()` opens the serial port
-  with `navigator.serial` at **57600 baud** and parses with `ThinkGearParser`
-  in-browser. Raw = **512 Hz**, scale **0.51 µV/unit**.
-- **Dead ends (do NOT retry):** pure Web Bluetooth GATT raw is not possible on
-  MWM2 (raw enable handshake is locked in NeuroSky's compiled SDK; `0x02`-over-GATT
-  is "empirically insufficient" per NF-ios). ThinkGear Connector + a WebSocket
-  bridge worked but the user rejected TGC as annoying — removed.
-- **macOS gotchas (this is what usually breaks live use):**
-  - Needs the one-time official NeuroSky driver so `/dev/cu.MindWaveMobile-*` appears.
-  - A serial port is **single-owner**: if another browser/tab holds it (e.g. Dia),
-    `open()` fails with "Failed to open serial port" / "Resource busy". Use one
-    browser; `connectNeuroSky()` releases any port it holds before reopening, and
-    `stopAll()` closes it.
-  - The port only opens while the headset is **actively connected** (solid LED,
-    macOS Bluetooth "Connected") — paired-but-disconnected fails. `open()` is
-    retried 4× to wake the RFCOMM link.
-  - Diagnose with `lsof /dev/cu.MindWaveMobile` (who holds it) and a native
-    `cat /dev/cu.MindWaveMobile` read to confirm the headset streams `0xAA` packets.
+The firmware's runtime rate ladder is `20/45/90/175/330/600/1000/2000` SPS, and the focus
+score is **not** computable on the bottom three. `focusFeasibility(fs, line)` encodes both
+reasons; the engine returns `fsOk: false` + `fsReason` and refuses to freeze a baseline:
 
-Reference project with the working native/SDK paths: `/Users/inky/Desktop/NF-ios`.
+| fs | passband top (`0.49·fs`) | β 13–30 Hz | 60 Hz mains | focus |
+|---|---|---|---|---|
+| 20 | 9.8 | absent | folds to DC (on-chip FIR active here) | ✗ |
+| 45 | 22.1 | truncated | **folds to 15 Hz — mid-β** | ✗ |
+| 90 | 44.1 | present | **folds to 30 Hz — top of β** | ✗ |
+| 175+ | ≥85.8 | present | notchable | ✓ |
+
+The ADS1220's on-chip 50/60 Hz FIR is only specified at 20 SPS (see the firmware's
+`ads1220_driver.cpp`), and the digital notch can only be placed below the passband edge — so
+at 45/90 SPS mains hum lands inside beta, the **numerator** of the score, with nothing
+removing it. Hum reads as concentration. `175` is both the lowest defensible rung and the v4
+boot default.
+
+The **alpha test** is a separate gate: alpha only reaches 13 Hz, so `bergerFeasibility(fs)`
+passes from **45 SPS** up (at 45 SPS mains folds to 15 Hz, outside the 8–13 Hz alpha band).
+
+`fsOk` is a third display gate alongside `signalOk` and `calibrating`. Honour all three.
 
 ## Conventions / gotchas
 

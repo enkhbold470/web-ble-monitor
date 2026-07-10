@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { FLOW_THRESHOLD, FocusEngine } from './focus';
+import { FLOW_THRESHOLD, FocusEngine, aliasOf, focusFeasibility } from './focus';
 
 const FS = 175; // firmware v4's real ADS1220 rate
+
+/** The firmware's runtime-selectable ADS1220 ladder (`~<0-7>`). */
+const LADDER = [20, 45, 90, 175, 330, 600, 1000, 2000];
 
 /** Feed `sec` seconds of a sum of sinusoids, sample by sample, in µV. */
 function feed(engine: FocusEngine, parts: [freq: number, amp: number][], sec: number): void {
@@ -267,5 +270,91 @@ describe('FocusEngine — blinks', () => {
 describe('constants', () => {
 	it('FLOW_THRESHOLD sits above the 50-point personal baseline', () => {
 		expect(FLOW_THRESHOLD).toBeGreaterThan(50);
+	});
+});
+
+describe('aliasOf — where an out-of-band tone folds to', () => {
+	it('leaves a tone below Nyquist alone', () => {
+		expect(aliasOf(60, 175)).toBeCloseTo(60, 6);
+	});
+
+	it('folds 60 Hz mains to 15 Hz at 45 SPS — the middle of beta', () => {
+		expect(aliasOf(60, 45)).toBeCloseTo(15, 6);
+	});
+
+	it('folds 60 Hz mains to 30 Hz at 90 SPS — the top edge of beta', () => {
+		expect(aliasOf(60, 90)).toBeCloseTo(30, 6);
+	});
+
+	it('folds 60 Hz mains to DC at 20 SPS', () => {
+		expect(aliasOf(60, 20)).toBeCloseTo(0, 6);
+	});
+});
+
+describe('focusFeasibility — where beta/(alpha+theta) is defensible', () => {
+	it('rejects 20 and 45 SPS: beta (to 30 Hz) is above the passband', () => {
+		for (const fs of [20, 45]) {
+			const f = focusFeasibility(fs, 60);
+			expect(f.ok).toBe(false);
+			expect(f.reason).toMatch(/β|beta/i);
+		}
+	});
+
+	it('rejects 90 SPS: beta fits, but 60 Hz mains folds into it and cannot be notched', () => {
+		const f = focusFeasibility(90, 60);
+		expect(f.ok).toBe(false);
+		// 0.49*90 = 44.1 Hz, so beta (30 Hz) is inside the passband — the fault is mains.
+		expect(f.reason).toMatch(/mains|60 Hz/i);
+		expect(f.reason).toContain('30');
+	});
+
+	it('accepts every rung from 175 SPS up', () => {
+		for (const fs of [175, 330, 600, 1000, 2000]) {
+			expect(focusFeasibility(fs, 60)).toEqual({ ok: true, reason: null });
+		}
+	});
+
+	it('175 SPS is the lowest usable rung on the firmware ladder', () => {
+		const usable = LADDER.filter((fs) => focusFeasibility(fs, 60).ok);
+		expect(usable).toEqual([175, 330, 600, 1000, 2000]);
+	});
+
+	it('a 50 Hz mains region also cannot use 90 SPS', () => {
+		// 50 >= 0.49*90 = 44.1, so the notch is still unplaceable.
+		expect(focusFeasibility(90, 50).ok).toBe(false);
+		expect(focusFeasibility(175, 50).ok).toBe(true);
+	});
+});
+
+describe('FocusEngine — refuses to score where the physics does not allow it', () => {
+	it('reports fsOk:false with a reason at 45 SPS', () => {
+		const e = new FocusEngine(45, { line: 60, baselineEngagement: 1 });
+		const m = e.read();
+		expect(m.fsOk).toBe(false);
+		expect(m.fsReason).toBeTruthy();
+	});
+
+	it('reports fsOk:true at the v4 default rate', () => {
+		const e = new FocusEngine(175, { line: 60 });
+		expect(e.read().fsOk).toBe(true);
+		expect(e.read().fsReason).toBeNull();
+	});
+
+	it('never leaves calibration and never scores at an unusable rate', () => {
+		// A strong beta tone at 90 SPS is exactly the mains-contamination scenario.
+		const e = new FocusEngine(90, { line: 60, calibrationSec: 1 });
+		for (let i = 0; i < 90 * 6; i++) e.push(30 * Math.sin((2 * Math.PI * 20 * i) / 90));
+		const m = e.read();
+		expect(m.fsOk).toBe(false);
+		expect(m.focus).toBe(0);
+		expect(m.baseline).toBeNull(); // must not freeze a baseline it cannot trust
+	});
+
+	it('still scores normally at 175 SPS', () => {
+		const e = new FocusEngine(FS, { line: 60, baselineEngagement: 0.5 });
+		feed(e, [[20, 30]], 5); // beta-dominant
+		const m = e.read();
+		expect(m.fsOk).toBe(true);
+		expect(m.focus).toBeGreaterThan(50);
 	});
 });

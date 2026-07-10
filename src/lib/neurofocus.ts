@@ -7,8 +7,18 @@
 
 import * as dsp from './dsp';
 import type { FilterChain, Psd } from './dsp';
-import { ThinkGearParser } from './thinkgear';
 import { ADC_PROFILES, type AdcProfile } from './adc';
+import { BergerProtocol, bergerFeasibility, type BergerState } from './berger';
+import {
+	SWEEP_SEC,
+	UV_PER_DIV,
+	V_DIVS,
+	autoEnvelope,
+	autosetUvPerDiv,
+	minMaxDecimate,
+	type SweepSec,
+	type UvPerDiv
+} from './scope';
 import {
 	BLE_CMD,
 	BLE_DATA,
@@ -19,16 +29,6 @@ import {
 	describeDiag,
 	type DiagReport
 } from './ble';
-
-// Web Bluetooth isn't in the default DOM lib; keep these loosely typed.
-/* eslint-disable @typescript-eslint/no-explicit-any */
-type Ble = any;
-
-interface CmpEntry {
-	freqs: Float64Array;
-	psd: Float64Array;
-	alpha: number;
-}
 
 const GREEK: Record<dsp.BandName, string> = {
 	delta: 'δ',
@@ -52,13 +52,24 @@ export const BLE_SAMPLE_RATE: Record<AdcProfile, number> = {
 	v2: V2_SAMPLE_RATE
 };
 
+/** Live state of the EEG scope's horizontal/vertical controls, for the Svelte header row. */
+export interface ScopeState {
+	sweepSec: SweepSec;
+	uvPerDiv: UvPerDiv | 'auto';
+	/** The gain actually in force this frame — equals `uvPerDiv` unless it is 'auto'. */
+	effectiveUvPerDiv: number;
+	hold: boolean;
+	secPerDiv: number;
+}
+
+export { SWEEP_SEC, UV_PER_DIV };
+
 export class NeuroFocus {
 	private adcProfile: AdcProfile = 'v4';
 	private settings: dsp.ScaleSettings = { ...ADC_PROFILES.v4 };
 	private demoAlpha = 18;
 
 	private fs = 600;
-	private unit: 'counts' | 'uV' = 'uV';
 	private filt: number[] = [];
 	private filtCap = 0;
 	private specCols: Float64Array[] = [];
@@ -68,7 +79,6 @@ export class NeuroFocus {
 	private hopAcc = 0;
 	private sampleWin: number[] = [];
 	private psd: Psd | null = null;
-	private cmp: { open: CmpEntry | null; closed: CmpEntry | null } = { open: null, closed: null };
 	private spsCount = 0;
 	private spsT = 0;
 	private ovf = 0;
@@ -88,18 +98,22 @@ export class NeuroFocus {
 	private demoIdx = 0;
 	private link: NeuroLink | null = null;
 
-	// NeuroSky MindWave: the headset's Bluetooth-serial link streams raw EEG (512 Hz)
-	// continuously with no enable command — so the browser reads it directly over the
-	// Web Serial API (no ThinkGear Connector, no bridge). Needs the one-time NeuroSky
-	// driver so the headset shows up as a serial port (/dev/cu.MindWaveMobile-*).
-	private nsPort: Ble = null;
-	private nsReader: Ble = null;
-	private nsAbort = false;
-	private readonly NS_BAUD = 57600;
+	// ---------- scope controls (EEG ACTIVITY) ----------
+	// The old trace drew one lineTo per sample over a fixed 4 s window and re-derived the
+	// vertical gain from the visible peak every frame. At 2000 SPS that overplots ~8000
+	// vertices into ~560 px, and the gain always stretched noise to fill the screen.
+	private sweepSec: SweepSec = 4;
+	/** 'auto' keeps auto-ranging, but through a fast-attack/slow-release envelope. */
+	private uvPerDiv: UvPerDiv | 'auto' = 'auto';
+	private autoEnv = 1;
+	private hold = false;
+	private holdBuf: number[] = [];
+	private onScope: ((s: ScopeState) => void) | null = null;
 
-	// NeuroSky raw ThinkGear unit -> µV (~0.51 µV/unit; the value NF-ios uses).
-	// Uncalibrated, but the eyes-open/closed alpha ratio is relative so unaffected.
-	private readonly NEUROSKY_UV = 0.51;
+	// ---------- guided Berger test ----------
+	private berger: BergerProtocol | null = null;
+	private onBerger: ((s: BergerState | null) => void) | null = null;
+	private beep: AudioContext | null = null;
 
 	// ---------- lifecycle ----------
 	mount(): void {
@@ -133,6 +147,7 @@ export class NeuroFocus {
 	}
 
 	private setFs(fs: number): void {
+		const changed = fs !== this.fs;
 		this.fs = fs;
 		// Hold enough filtered history for the Welch window (+ headroom) so the PSD can
 		// average many segments instead of the ~3 a 4 s buffer allowed.
@@ -140,16 +155,34 @@ export class NeuroFocus {
 		this.hop = Math.round(fs * 0.18);
 		this.chain = dsp.makeChain(fs, { lo: 1, hi: 45, line: this.settings.line });
 		this.welchN = dsp.nextPow2(Math.min(Math.round(fs * 2), 1024));
+		// ~1 s of samples per STFT column. Pinned at 256 this gave 7.8 Hz bins at 2000 SPS
+		// (alpha and theta collapsing into one or two) and a 12.8 s column at 20 SPS.
+		this.nfftSpec = Math.max(128, Math.min(1024, dsp.nextPow2(Math.round(fs))));
 		this.setText('nf-fs', String(Math.round(fs)));
+		// Every buffer below holds samples filtered at the OLD rate and binned at the old
+		// nfft. Reading them at the new fs slides every frequency by the rate ratio, so the
+		// PSD would stay corrupt for a whole psdWindowS. Drop them, and abandon any Berger
+		// run in flight — its epochs were sample-clocked against the old rate.
+		if (changed) {
+			this.reset();
+			if (this.berger) {
+				this.berger = null;
+				this.emitBerger();
+				this.msg(`rate changed to ${Math.round(fs)} SPS — alpha test cancelled`);
+			}
+		}
 	}
 
 	// ---------- ADC scaling profile (v2 12-bit unipolar vs v4 24-bit bipolar) ----------
 	// Swaps the counts->µV ScaleSettings and rebuilds the filter chain. Only affects the
-	// counts sources (ESP32 BLE); the µV sources (file/NeuroSky/demo) bypass countsToUv.
+	// counts sources (ESP32 BLE); the µV sources (file/demo) bypass countsToUv.
 	setAdcProfile(p: AdcProfile): void {
 		this.adcProfile = p;
 		this.settings = { ...ADC_PROFILES[p] };
 		this.setFs(this.fs); // rebuild makeChain with settings.line
+		// setFs only flushes on a rate change, but the counts→µV scale just moved under the
+		// buffered samples (v2 vs v4 differ by ~4096x), so the history is meaningless now.
+		this.reset();
 		this.msg(
 			p === 'v2'
 				? 'ADC profile · V2 · ESP32-C3 12-bit unipolar'
@@ -184,6 +217,9 @@ export class NeuroFocus {
 		this.hopAcc = 0;
 		this.chain?.reset();
 		this.psd = null;
+		this.holdBuf = [];
+		this.autoEnv = 1;
+		this.ovf = 0;
 	}
 
 	private msg(t: string): void {
@@ -205,6 +241,9 @@ export class NeuroFocus {
 			this.specCols.push(col);
 			if (this.specCols.length > this.specCap) this.specCols.shift();
 		}
+		// The Berger protocol is sample-clocked, so it must see the band-passed stream here
+		// rather than sniff a buffer on a timer.
+		this.berger?.push(y);
 		this.spsCount++;
 	}
 
@@ -222,10 +261,18 @@ export class NeuroFocus {
 			const now = performance.now();
 			if (now - this.spsT > 500) {
 				this.setText('nf-sps', String(Math.round((this.spsCount * 1000) / (now - this.spsT))));
+				// Dropped BLE notifications, counted host-side from the frame seq gaps. The
+				// firmware's own ring drops silently at 1000/2000 SPS, so this is the only
+				// place a saturated link becomes visible.
+				if (this.link) this.ovf = this.link.stats.dropped;
 				this.setText('nf-ovf', String(this.ovf));
 				this.spsCount = 0;
 				this.spsT = now;
+				// The AUTO gain moves every frame; republish it at the readout cadence rather
+				// than re-rendering the header 60x/s.
+				if (this.uvPerDiv === 'auto') this.emitScope();
 			}
+			if (this.berger) this.emitBerger();
 			if (now - this.lastPsd > 450 && this.filt.length > this.welchN) {
 				this.lastPsd = now;
 				const seg = this.filt.slice(
@@ -266,6 +313,67 @@ export class NeuroFocus {
 		return { x, w: c.clientWidth, h: c.clientHeight };
 	}
 
+	// ---------- scope controls ----------
+	/** µV per vertical division actually in force this frame. */
+	private gain(data: ArrayLike<number>): number {
+		if (this.uvPerDiv !== 'auto') return this.uvPerDiv;
+		let peak = 1;
+		for (let i = 0; i < data.length; i++) peak = Math.max(peak, Math.abs(data[i]));
+		this.autoEnv = autoEnvelope(this.autoEnv, peak);
+		// Spread the envelope over the half-screen (V_DIVS/2 divisions), with 15% headroom.
+		return (this.autoEnv * 1.15) / (V_DIVS / 2);
+	}
+
+	private emitScope(): void {
+		const eff =
+			this.uvPerDiv === 'auto'
+				? Math.max(0.01, (this.autoEnv * 1.15) / (V_DIVS / 2))
+				: this.uvPerDiv;
+		this.onScope?.({
+			sweepSec: this.sweepSec,
+			uvPerDiv: this.uvPerDiv,
+			effectiveUvPerDiv: eff,
+			hold: this.hold,
+			secPerDiv: this.sweepSec / 8
+		});
+	}
+
+	onScopeChange(cb: (s: ScopeState) => void): void {
+		this.onScope = cb;
+		this.emitScope();
+	}
+
+	setSweep(sec: SweepSec): void {
+		this.sweepSec = sec;
+		this.emitScope();
+	}
+
+	setUvPerDiv(v: UvPerDiv | 'auto'): void {
+		this.uvPerDiv = v;
+		this.emitScope();
+	}
+
+	setHold(on: boolean): void {
+		this.hold = on;
+		// Freeze against a snapshot so the trace stays put while samples keep arriving.
+		this.holdBuf = on ? this.visibleWindow() : [];
+		this.emitScope();
+	}
+
+	/** One shot: fit the 99.5th-percentile amplitude and return to a 4 s sweep. */
+	autoset(): void {
+		const data = this.visibleWindow();
+		if (data.length >= 2) this.uvPerDiv = autosetUvPerDiv(data);
+		this.sweepSec = 4;
+		this.emitScope();
+		this.msg(`autoset · ${this.sweepSec / 8} s/div · ${this.uvPerDiv} µV/div`);
+	}
+
+	private visibleWindow(): number[] {
+		const n = Math.min(this.filt.length, Math.round(this.fs * this.sweepSec));
+		return this.filt.slice(-Math.max(0, n));
+	}
+
 	// ---------- green phosphor: raw trace ----------
 	private drawRaw(): void {
 		const g = this.ctx('nf-raw');
@@ -274,8 +382,8 @@ export class NeuroFocus {
 		x.clearRect(0, 0, w, h);
 		x.strokeStyle = 'rgba(90,200,120,.11)';
 		x.lineWidth = 1;
-		for (let i = 1; i < 4; i++) {
-			const y = (h * i) / 4;
+		for (let i = 1; i < V_DIVS; i++) {
+			const y = (h * i) / V_DIVS;
 			x.beginPath();
 			x.moveTo(0, y);
 			x.lineTo(w, y);
@@ -293,29 +401,53 @@ export class NeuroFocus {
 		x.moveTo(0, h / 2);
 		x.lineTo(w, h / 2);
 		x.stroke();
-		const n = Math.min(this.filt.length, Math.round(this.fs * 4));
-		if (n < 2) return;
-		const data = this.filt.slice(-n);
-		let mx = 1;
-		for (const v of data) mx = Math.max(mx, Math.abs(v));
-		mx *= 1.15;
+
+		const data = this.hold ? this.holdBuf : this.visibleWindow();
+		if (data.length < 2) return;
+		const uvDiv = this.gain(data);
+		const half = h / 2 - 2;
+		// v maps to (V_DIVS/2) divisions of deflection at full scale.
+		const Y = (v: number): number =>
+			h / 2 - Math.max(-1, Math.min(1, v / (uvDiv * (V_DIVS / 2)))) * half;
+
 		x.save();
 		x.shadowColor = 'rgba(102,240,138,.6)';
 		x.shadowBlur = 7;
 		x.strokeStyle = '#86ffa6';
 		x.lineWidth = 1.4;
 		x.beginPath();
-		for (let i = 0; i < n; i++) {
-			const px = (i / (n - 1)) * w,
-				py = h / 2 - (data[i] / mx) * (h / 2 - 4);
-			i ? x.lineTo(px, py) : x.moveTo(px, py);
+		const cols = Math.max(1, Math.round(w));
+		if (data.length <= cols) {
+			// Fewer samples than pixels — a plain polyline reads better than stubs.
+			for (let i = 0; i < data.length; i++) {
+				const px = (i / (data.length - 1)) * w;
+				const py = Y(data[i]);
+				if (i) x.lineTo(px, py);
+				else x.moveTo(px, py);
+			}
+		} else {
+			// One vertical [min,max] segment per pixel column. Overplotting 8000 vertices
+			// into 560 px is what made 2000 SPS look like a solid noise band.
+			const reduced = minMaxDecimate(data, cols);
+			for (let c = 0; c < reduced.length; c++) {
+				const px = (c / Math.max(1, reduced.length - 1)) * w;
+				x.moveTo(px, Y(reduced[c].max));
+				x.lineTo(px, Y(reduced[c].min));
+			}
 		}
 		x.stroke();
 		x.restore();
+
 		x.fillStyle = 'rgba(134,255,166,.55)';
 		x.font = "10px 'Space Mono',monospace";
-		x.fillText('+' + mx.toFixed(0) + 'µV', 5, 12);
-		x.fillText('-' + mx.toFixed(0), 5, h - 5);
+		const full = uvDiv * (V_DIVS / 2);
+		x.fillText('+' + full.toFixed(full < 10 ? 1 : 0) + 'µV', 5, 12);
+		x.fillText('-' + full.toFixed(full < 10 ? 1 : 0), 5, h - 5);
+		if (this.hold) {
+			x.fillStyle = 'rgba(255,179,58,.9)';
+			x.font = "600 10px 'Space Mono',monospace";
+			x.fillText('HOLD', w - 40, 12);
+		}
 	}
 
 	// ---------- amber phosphor: Welch PSD ----------
@@ -435,10 +567,12 @@ export class NeuroFocus {
 		x.clearRect(0, 0, w, h);
 		const cols = this.specCols;
 		if (!cols.length) return;
-		const fmax = 45,
-			fs = this.fs,
+		const fs = this.fs,
 			nb = this.nfftSpec / 2;
-		const kmax = Math.min(nb, Math.round(fmax / (fs / this.nfftSpec)));
+		// Above 0.49*fs the analysis chain has already rolled off; painting those bins would
+		// render pure garbage as signal at the low rungs (Nyquist is 10 Hz at 20 SPS).
+		const fmax = Math.min(45, 0.49 * fs);
+		const kmax = Math.max(1, Math.min(nb, Math.round(fmax / (fs / this.nfftSpec))));
 		const cw = Math.max(1.2, w / Math.max(cols.length, 60));
 		const start = Math.max(0, cols.length - Math.ceil(w / cw));
 		let lo = Infinity,
@@ -465,6 +599,7 @@ export class NeuroFocus {
 		x.fillStyle = 'rgba(150,240,170,.6)';
 		x.font = "9px 'Space Mono',monospace";
 		for (const f of [10, 20, 30, 40]) {
+			if (f >= fmax) continue; // never label a frequency this rate cannot represent
 			const py = h - (f / fmax) * h;
 			x.fillText(String(f), 3, py - 1);
 		}
@@ -526,7 +661,6 @@ export class NeuroFocus {
 		this.reset();
 		// Provisional fs until the board's INFO arrives (connect() sends 'i'); onInfo corrects it.
 		this.setFs(BLE_SAMPLE_RATE[version]);
-		this.unit = 'counts';
 		this.setAdcProfile(version);
 		try {
 			await this.link.connect();
@@ -561,7 +695,9 @@ export class NeuroFocus {
 		}
 		try {
 			const info = await this.link.setSampleRate(sps);
-			this.msg(info?.sps ? `rate → ${info.sps} SPS (batch ${info.batch ?? '?'})` : 'rate command sent');
+			this.msg(
+				info?.sps ? `rate → ${info.sps} SPS (batch ${info.batch ?? '?'})` : 'rate command sent'
+			);
 		} catch (e) {
 			this.msg('rate change failed: ' + (e instanceof Error ? e.message : String(e)));
 		}
@@ -596,127 +732,6 @@ export class NeuroFocus {
 		}
 	}
 
-	// ---------- NeuroSky MindWave (Web Serial / ThinkGear, all in-browser) ----------
-	// The MindWave streams raw EEG continuously over its Bluetooth-serial link, so
-	// we read it straight from the browser — no ThinkGear Connector, no bridge.
-	// Pick the headset's serial port (it appears as /dev/cu.MindWaveMobile-* once
-	// the one-time NeuroSky driver is installed and the headset is paired).
-	async connectNeuroSky(): Promise<void> {
-		const nav = navigator as Navigator & { serial?: Ble };
-		if (!nav.serial) {
-			const b = this.el('nf-banner');
-			if (b) {
-				b.style.display = 'block';
-				b.textContent =
-					'⚠ Web Serial unavailable — NeuroSky needs Chrome / Edge on desktop (open BERGER-1 standalone, not in a frame).';
-			}
-			this.msg('Web Serial not available — use Chrome / Edge on desktop.');
-			return;
-		}
-		// Release any port we already hold — re-clicking NeuroSky must not collide
-		// with our own open handle (that self-inflicts "Failed to open / busy").
-		this.nsAbort = true;
-		try {
-			if (this.nsReader) await this.nsReader.cancel();
-		} catch {
-			/* ignore */
-		}
-		try {
-			if (this.nsPort) await this.nsPort.close();
-		} catch {
-			/* ignore */
-		}
-		this.nsReader = this.nsPort = null;
-		this.nsAbort = false;
-		let port: Ble;
-		try {
-			this.msg('select the MindWave serial port (MindWaveMobile)…');
-			port = await nav.serial.requestPort();
-		} catch {
-			this.msg('NeuroSky: no port selected');
-			return;
-		}
-		// Opening a paired Bluetooth-serial port only works while the headset is
-		// actively connected. The first open() often just wakes the RFCOMM link,
-		// so retry a few times before giving up.
-		const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-		let lastErr: unknown = null;
-		for (let attempt = 1; attempt <= 4; attempt++) {
-			try {
-				await port.open({ baudRate: this.NS_BAUD });
-				lastErr = null;
-				break;
-			} catch (e) {
-				lastErr = e;
-				this.msg(`opening MindWave… waking Bluetooth link (try ${attempt}/4)`);
-				await sleep(800);
-			}
-		}
-		if (lastErr) {
-			this.neuroSkyOpenFailed(lastErr);
-			return;
-		}
-		this.nsPort = port;
-		this.nsAbort = false;
-		this.stopDemo();
-		this.reset();
-		this.setFs(512);
-		this.unit = 'uV';
-		const banner = this.el('nf-banner');
-		if (banner) banner.style.display = 'none';
-		this.setMode('live · neurosky', '#5fe886');
-		this.msg('NeuroSky MindWave linked — streaming raw EEG @ 512 Hz');
-		void this.readMindWave();
-	}
-
-	private neuroSkyOpenFailed(e: unknown): void {
-		const m = e instanceof Error ? e.message : String(e);
-		this.setMode('idle', '#2a3329');
-		this.msg('NeuroSky: ' + m);
-		const b = this.el('nf-banner');
-		if (b) {
-			b.style.display = 'block';
-			// "Failed to open" almost always means the port is busy (held by another
-			// browser/tab/process) or the headset is paired-but-not-connected.
-			b.innerHTML =
-				'⚠ Couldn’t open the MindWave port. Most likely it’s <b>held by another browser or tab</b> — ' +
-				'close every other BERGER tab and <b>fully quit other browsers</b> (Dia, Chrome, Arc, Edge), then click NeuroSky again. ' +
-				'Otherwise the headset is <b>paired but not connected</b>: turn it ON and confirm macOS Bluetooth shows <b>“Connected”</b> (solid LED). ' +
-				'If two “MindWaveMobile” ports are listed, pick the other one.';
-		}
-	}
-
-	private async readMindWave(): Promise<void> {
-		const parser = new ThinkGearParser();
-		try {
-			while (this.nsPort && this.nsPort.readable && !this.nsAbort) {
-				this.nsReader = this.nsPort.readable.getReader();
-				try {
-					for (;;) {
-						const { value, done } = await this.nsReader.read();
-						if (done || this.nsAbort) break;
-						if (!value) continue;
-						const r = parser.push(value as Uint8Array);
-						for (const s of r.raw) this.ingest(s * this.NEUROSKY_UV, true);
-						if (r.poorSignal !== undefined && r.poorSignal >= 200)
-							this.msg('MindWave: no contact — sit still and adjust the headset / ear clip');
-					}
-				} finally {
-					this.nsReader.releaseLock();
-					this.nsReader = null;
-				}
-			}
-		} catch (e) {
-			if (!this.nsAbort)
-				this.msg('NeuroSky stream error: ' + (e instanceof Error ? e.message : String(e)));
-		}
-	}
-
-	// ---------- Emotiv (Cortex API) — not yet implemented ----------
-	connectEmotiv(): void {
-		this.msg('Emotiv (Cortex API) — coming soon · raw EEG needs an Emotiv license.');
-	}
-
 	openFile(): void {
 		(this.el('nf-file') as HTMLInputElement | null)?.click();
 	}
@@ -730,7 +745,6 @@ export class NeuroFocus {
 			this.stopDemo();
 			this.reset();
 			this.setFs(cap.fs);
-			this.unit = cap.unit;
 			this.ingestMany(cap.samples, cap.unit === 'uV');
 			this.setMode('file · ' + f.name.slice(0, 18), '#5aa9ff');
 			this.msg('loaded ' + cap.samples.length + ' samples @ ' + Math.round(cap.fs) + ' Hz');
@@ -751,7 +765,6 @@ export class NeuroFocus {
 		});
 		this.reset();
 		this.setFs(600);
-		this.unit = 'uV';
 		this.ingestMany(cap.samples, true);
 		this.demoData = cap.samples;
 		this.demoIdx = 0;
@@ -774,49 +787,96 @@ export class NeuroFocus {
 
 	async stopAll(): Promise<void> {
 		this.stopDemo();
-		this.nsAbort = true;
 		// NeuroLink stops the stream and drops GATT; leaving the link up would keep the
 		// board's single central slot occupied.
 		await this.link?.disconnect();
 		this.link = null;
-		try {
-			if (this.nsReader) await this.nsReader.cancel();
-			if (this.nsPort) await this.nsPort.close();
-		} catch {
-			/* ignore teardown errors */
-		}
-		this.nsReader = this.nsPort = null;
+		this.berger = null;
+		this.emitBerger();
+		this.ovf = 0;
 		this.setMode('idle', '#2a3329');
 		this.msg('halted');
 	}
 
-	// ---------- eyes-open / closed compare ----------
-	private capture(which: 'open' | 'closed'): void {
-		if (this.filt.length < this.welchN) {
-			this.msg('not enough data captured yet');
+	// ---------- guided Berger test (eyes open / closed) ----------
+	// The old version snapshotted the trailing 10 s the instant you clicked, with no timing
+	// cue, no artifact rejection and no averaging — a single blink decided the ratio, and
+	// the readout sat at a hardcoded 0.00 until both sides had been captured.
+	onBergerChange(cb: (s: BergerState | null) => void): void {
+		this.onBerger = cb;
+		this.emitBerger();
+	}
+
+	private emitBerger(): void {
+		this.onBerger?.(this.berger ? this.berger.state() : null);
+	}
+
+	/** A short cue at every phase change, so the subject never has to watch the screen. */
+	private tone(freq: number, ms = 150): void {
+		try {
+			this.beep ??= new AudioContext();
+			if (this.beep.state === 'suspended') void this.beep.resume();
+			const t = this.beep.currentTime;
+			const osc = this.beep.createOscillator();
+			const gain = this.beep.createGain();
+			osc.type = 'sine';
+			osc.frequency.value = freq;
+			osc.connect(gain).connect(this.beep.destination);
+			gain.gain.setValueAtTime(0.07, t);
+			gain.gain.exponentialRampToValueAtTime(0.0001, t + ms / 1000);
+			osc.start(t);
+			osc.stop(t + ms / 1000);
+		} catch {
+			/* audio is a nicety — never let it break the measurement */
+		}
+	}
+
+	bergerStart(): void {
+		const feas = bergerFeasibility(this.fs);
+		if (!feas.ok) {
+			this.msg('alpha test unavailable: ' + feas.reason);
 			return;
 		}
-		const seg = Float64Array.from(
-			this.filt.slice(-Math.min(this.filt.length, Math.round(this.fs * this.psdWindowS)))
-		);
-		const { freqs, psd } = dsp.welch(seg, this.fs, this.welchN, this.welchOverlap);
-		this.cmp[which] = { freqs, psd, alpha: dsp.bandPowers(freqs, psd).alpha };
-		this.msg('captured eyes-' + which + ' spectrum');
+		this.setText('nf-ratio', '—');
+		this.setText('nf-verdict', '');
+		this.berger = new BergerProtocol(this.fs, {
+			onPhaseChange: (phase, condition) => {
+				if (phase === 'open') this.tone(660);
+				else if (phase === 'closed') this.tone(440);
+				else if (phase === 'done') this.tone(880, 260);
+				if (condition) this.msg(`alpha test · eyes ${condition}`);
+				if (phase === 'done') this.finishBerger();
+				this.emitBerger();
+			}
+		});
+		this.berger.start();
+		this.msg('alpha test · get ready — sit still, breathe normally');
+		this.emitBerger();
+	}
+
+	bergerAbort(): void {
+		if (!this.berger) return;
+		this.berger.abort();
+		this.emitBerger();
+		this.berger = null;
+		this.msg('alpha test aborted');
+		this.emitBerger();
+	}
+
+	private finishBerger(): void {
+		const res = this.berger?.state().result;
+		if (!res) return;
+		this.setText('nf-ratio', res.ratio === null ? '—' : res.ratio.toFixed(2));
+		this.setText('nf-verdict', res.verdict.toUpperCase());
 		this.drawCmp();
-		if (this.cmp.open && this.cmp.closed) {
-			const r = this.cmp.closed.alpha / (this.cmp.open.alpha || 1e-9);
-			this.setText('nf-ratio', r.toFixed(2));
-		}
+		const total = res.acceptedEpochs + res.rejectedEpochs;
+		this.msg(
+			`alpha test ${res.verdict} · C/O ${res.ratio === null ? 'n/a' : res.ratio.toFixed(2)}× · ` +
+				`${res.acceptedEpochs}/${total} epochs kept · around-ear sites see a weaker Berger effect than occipital`
+		);
 	}
 
-	captureOpen(): void {
-		this.capture('open');
-	}
-
-	captureClosed(): void {
-		this.capture('closed');
-	}
-
+	/** Overlay the averaged eyes-open and eyes-closed spectra, 0–30 Hz. */
 	private drawCmp(): void {
 		const c = this.el('nf-cmp') as HTMLCanvasElement | null;
 		if (!c) return;
@@ -825,14 +885,15 @@ export class NeuroFocus {
 		const w = c.width,
 			h = c.height;
 		x.clearRect(0, 0, w, h);
-		const series: [keyof typeof this.cmp, string][] = [
-			['open', '#5aa9ff'],
-			['closed', '#ffae5a']
+		const spec = this.berger?.spectra();
+		if (!spec) return;
+		const series: [Psd | null, string][] = [
+			[spec.open, '#5aa9ff'],
+			[spec.closed, '#ffae5a']
 		];
 		let lo = Infinity,
 			hi = -Infinity;
-		for (const [k] of series) {
-			const s = this.cmp[k];
+		for (const [s] of series) {
 			if (!s) continue;
 			for (let i = 0; i < s.freqs.length; i++)
 				if (s.freqs[i] <= 30) {
@@ -843,10 +904,10 @@ export class NeuroFocus {
 		}
 		if (!isFinite(lo)) return;
 		if (hi - lo < 1) hi = lo + 1;
+		// Shade the 8–13 Hz alpha band the test actually integrates.
 		x.fillStyle = 'rgba(127,233,216,.10)';
 		x.fillRect((8 / 30) * w, 0, (5 / 30) * w, h);
-		for (const [k, col] of series) {
-			const s = this.cmp[k];
+		for (const [s, col] of series) {
 			if (!s) continue;
 			x.save();
 			x.shadowColor = col;
@@ -854,13 +915,14 @@ export class NeuroFocus {
 			x.strokeStyle = col;
 			x.lineWidth = 1.3;
 			x.beginPath();
-			let st = false;
+			let started = false;
 			for (let i = 0; i < s.freqs.length; i++)
 				if (s.freqs[i] <= 30) {
-					const px = (s.freqs[i] / 30) * w,
-						py = (1 - (Math.log10(s.psd[i] + 1e-6) - lo) / (hi - lo)) * (h - 4) + 2;
-					st ? x.lineTo(px, py) : x.moveTo(px, py);
-					st = true;
+					const px = (s.freqs[i] / 30) * w;
+					const py = (1 - (Math.log10(s.psd[i] + 1e-6) - lo) / (hi - lo)) * (h - 4) + 2;
+					if (started) x.lineTo(px, py);
+					else x.moveTo(px, py);
+					started = true;
 				}
 			x.stroke();
 			x.restore();

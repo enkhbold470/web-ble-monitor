@@ -9,9 +9,12 @@
 	import { NeuroLink, V4_SAMPLE_RATE } from '$lib/ble';
 	import { FocusEngine } from '$lib/focus';
 
-	// firmware/v4: ADS1220 at 175 SPS (DR_LVL_3), 24-bit bipolar, AD8422 in-amp ahead of it.
-	const FS = V4_SAMPLE_RATE;
+	// firmware/v4 boots at 175 SPS (DR_LVL_3), 24-bit bipolar, AD8422 in-amp ahead of it —
+	// but the rate is runtime-selectable ('~'), so this is only the pre-v4.1 fallback. The
+	// board's INFO line is the authority; see onInfo below.
+	const FALLBACK_FS = V4_SAMPLE_RATE;
 	const SCALE = ADC_PROFILES.v4;
+	const MAINS = 60; // North America
 
 	// ---- reactive UI state ----
 	let status = $state<'idle' | 'connecting' | 'live' | 'error'>('idle');
@@ -25,22 +28,31 @@
 	let signalOk = $state(false); // is there real electrode activity at all?
 	let calibrating = $state(true); // focus is meaningless until the baseline is known
 	let calLeft = $state(0);
+	let fsOk = $state(true); // false when the board's rate cannot carry beta at all
+	let fsReason = $state<string | null>(null);
 	let spark: HTMLCanvasElement | null = $state(null);
 
 	// ---- processing state (non-reactive) ----
 	let link: NeuroLink | null = null;
 	let blinkTimer: ReturnType<typeof setTimeout> | null = null;
 	let raf = 0;
+	let fs = FALLBACK_FS;
 
-	const engine = new FocusEngine(FS, {
-		line: 60,
-		onBlink: () => {
-			blinkCount++;
-			blinking = true;
-			if (blinkTimer) clearTimeout(blinkTimer);
-			blinkTimer = setTimeout(() => (blinking = false), 450);
-		}
-	});
+	const onBlink = () => {
+		blinkCount++;
+		blinking = true;
+		if (blinkTimer) clearTimeout(blinkTimer);
+		blinkTimer = setTimeout(() => (blinking = false), 450);
+	};
+
+	// FocusEngine.fs is readonly by design (the filter chain and Welch window are sized from
+	// it), so following the board's rate means rebuilding rather than mutating.
+	let engine = new FocusEngine(fs, { line: MAINS, onBlink });
+
+	function rebuildEngine() {
+		engine = new FocusEngine(fs, { line: MAINS, onBlink });
+		blinkCount = 0;
+	}
 
 	function tick() {
 		raf = requestAnimationFrame(tick);
@@ -50,16 +62,20 @@
 		signalOk = m.signalOk;
 		calibrating = m.calibrating;
 		calLeft = m.calibrationLeftSec;
+		fsOk = m.fsOk;
+		fsReason = m.fsReason;
 		// 50 is this user's own baseline engagement, so "focused" means meaningfully above it.
-		mood = m.calibrating
-			? 'CALIBRATING'
-			: !m.signalOk
-				? 'NEUTRAL'
-				: m.focus >= 60
-					? 'FOCUSED'
-					: m.calm >= 55
-						? 'RELAXED'
-						: 'NEUTRAL';
+		mood = !m.fsOk
+			? 'NEUTRAL'
+			: m.calibrating
+				? 'CALIBRATING'
+				: !m.signalOk
+					? 'NEUTRAL'
+					: m.focus >= 60
+						? 'FOCUSED'
+						: m.calm >= 55
+							? 'RELAXED'
+							: 'NEUTRAL';
 		sps = link?.stats.sps ?? 0;
 		drawSpark();
 	}
@@ -72,7 +88,7 @@
 		const w = c.width,
 			h = c.height;
 		ctx.clearRect(0, 0, w, h);
-		const data = engine.trace(FS * 3);
+		const data = engine.trace(fs * 3);
 		if (data.length < 2) return;
 		let mx = 1;
 		for (const v of data) mx = Math.max(mx, Math.abs(v));
@@ -104,6 +120,16 @@
 				status =
 					s === 'live' ? 'live' : s === 'error' ? 'error' : s === 'idle' ? 'idle' : 'connecting';
 				if (s !== 'live') signalOk = false;
+			},
+			// The board's rate is runtime-selectable and it re-emits INFO on every change.
+			// Without this, a board at any rate other than the fallback would have every
+			// frequency scaled by realFs/175 and the score would be silently wrong.
+			onInfo: (i) => {
+				if (i.sps && i.sps !== fs) {
+					fs = i.sps;
+					rebuildEngine();
+					statusMsg = `Headset reports ${i.sps} SPS — recalibrating.`;
+				}
 			}
 		});
 		try {
@@ -172,7 +198,12 @@
 				{mood}
 			</div>
 
-			{#if calibrating}
+			{#if !fsOk}
+				<p class="note" style="margin-top:0">
+					Focus is unavailable at this sample rate. {fsReason}. Switch the headset to 175 SPS or
+					faster.
+				</p>
+			{:else if calibrating}
 				<p class="note" style="margin-top:0">
 					Learning your baseline — sit normally for another {calLeft.toFixed(0)}s. Focus is scored
 					against <b>you</b>, not against other people.
@@ -183,8 +214,10 @@
 			<div class="meters">
 				<div class="meter">
 					<span class="lbl">FOCUS</span>
-					<div class="bar"><i style="width:{calibrating ? 0 : focus}%" class="fill focus"></i></div>
-					<span class="pct">{calibrating ? '—' : focus}</span>
+					<div class="bar">
+						<i style="width:{calibrating || !fsOk ? 0 : focus}%" class="fill focus"></i>
+					</div>
+					<span class="pct">{calibrating || !fsOk ? '—' : focus}</span>
 				</div>
 				<div class="meter">
 					<span class="lbl">CALM</span>

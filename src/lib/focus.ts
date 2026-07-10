@@ -22,6 +22,68 @@
 import * as dsp from './dsp';
 import type { BandName } from './dsp';
 
+/** `dsp.makeChain` clamps the analysis low-pass to this fraction of fs. Keep the two in step. */
+const PASSBAND_FRACTION = 0.49;
+
+const BETA = dsp.BAND_DEFS.find(([n]) => n === 'beta') as [BandName, number, number];
+const BETA_LO = BETA[1];
+const BETA_HI = BETA[2];
+
+/**
+ * Fold `f` into the representable band [0, fs/2]. A tone above Nyquist does not vanish —
+ * it reappears at a mirrored frequency, indistinguishable from a real rhythm there.
+ */
+export function aliasOf(f: number, fs: number): number {
+	if (fs <= 0) return 0;
+	const m = ((f % fs) + fs) % fs;
+	return m <= fs / 2 ? m : fs - m;
+}
+
+export interface FocusFeasibility {
+	ok: boolean;
+	/** Plain-language reason the score cannot be trusted at this rate, or null when it can. */
+	reason: string | null;
+}
+
+/**
+ * Can `beta/(alpha+theta)` be measured honestly at this sample rate?
+ *
+ * Two independent ways it cannot, both of which the firmware's rate ladder can produce:
+ *
+ * 1. **Beta is above the passband.** Beta reaches 30 Hz, and the analysis low-pass is
+ *    clamped to `0.49*fs`, so anything under ~61 SPS simply has no beta to measure. The
+ *    numerator collapses to ~0 and the score reads a confident, permanent 0.
+ * 2. **Mains folds into beta.** The digital notch can only be placed below the passband
+ *    edge. At 45 SPS a 60 Hz line aliases to 15 Hz and at 90 SPS to 30 Hz — both inside
+ *    beta. The ADS1220's on-chip 50/60 Hz FIR is only specified at 20 SPS (see the
+ *    firmware's `ads1220_driver.cpp`), so nothing else removes it either. Mains hum then
+ *    inflates the focus numerator and reads exactly like concentration.
+ *
+ * On the firmware ladder (20/45/90/175/330/600/1000/2000) both conditions first hold at
+ * **175 SPS**, which is also the v4 boot default.
+ */
+export function focusFeasibility(fs: number, line = 60): FocusFeasibility {
+	const top = PASSBAND_FRACTION * fs;
+	if (top < BETA_HI) {
+		return {
+			ok: false,
+			reason: `β (${BETA_LO}–${BETA_HI} Hz) is above the passband: at ${fs} SPS the analysis low-pass stops at ${top.toFixed(1)} Hz`
+		};
+	}
+	if (line >= top) {
+		const fold = aliasOf(line, fs);
+		const inBeta = fold >= BETA_LO && fold <= BETA_HI;
+		return {
+			ok: false,
+			reason:
+				`${line} Hz mains folds to ${fold.toFixed(1)} Hz at ${fs} SPS and cannot be notched ` +
+				`(${line} Hz is above the ${top.toFixed(1)} Hz passband)` +
+				(inBeta ? ' — directly inside β, the focus numerator' : '')
+		};
+	}
+	return { ok: true, reason: null };
+}
+
 export interface FocusMetrics {
 	/** Raw Pope engagement index, beta/(alpha+theta). Unbounded, > 0. */
 	engagement: number;
@@ -50,6 +112,13 @@ export interface FocusMetrics {
 	calibrationLeftSec: number;
 	/** The frozen baseline engagement, once known. */
 	baseline: number | null;
+	/**
+	 * False when this sample rate physically cannot support the score — beta above the
+	 * passband, or mains folding into beta. A third gate alongside `signalOk` and
+	 * `calibrating`: show `fsReason`, never a number.
+	 */
+	fsOk: boolean;
+	fsReason: string | null;
 }
 
 export interface FocusEngineOptions {
@@ -98,11 +167,11 @@ const DENOM_FLOOR = 1e-9;
  *
  * ## What this number is worth
  *
- * This is ONE ear/forehead-referenced channel. Beta (13–30 Hz) overlaps jaw, temporalis and
- * neck EMG, so clenching your teeth raises "focus" exactly like concentrating does. A single
- * channel cannot separate them. Treat the score as a within-session, within-user relative
- * signal. It is not a measurement of anyone's cognition, and it is not comparable across
- * people. `signalOk` and `calibrating` exist so the UI can refuse to show a number it has
+ * This is ONE around-ear channel. Beta (13–30 Hz) overlaps jaw, temporalis and neck EMG, so
+ * clenching your teeth raises "focus" exactly like concentrating does. A single channel
+ * cannot separate them. Treat the score as a within-session, within-user relative signal.
+ * It is not a measurement of anyone's cognition, and it is not comparable across people.
+ * `signalOk`, `calibrating` and `fsOk` exist so the UI can refuse to show a number it has
  * not earned — use them.
  */
 export class FocusEngine {
@@ -136,6 +205,9 @@ export class FocusEngine {
 
 	private metrics: FocusMetrics;
 
+	/** Whether this rate can carry the score at all. Frozen at construction; fs is readonly. */
+	readonly feasibility: FocusFeasibility;
+
 	constructor(fs: number, options: FocusEngineOptions = {}) {
 		this.fs = fs;
 		this.opts = {
@@ -149,6 +221,7 @@ export class FocusEngine {
 			baselineEngagement: options.baselineEngagement,
 			onBlink: options.onBlink
 		};
+		this.feasibility = focusFeasibility(fs, this.opts.line);
 		this.analysis = dsp.makeChain(fs, { lo: 1, hi: 45, line: this.opts.line });
 		this.blinkChain = dsp.makeChain(fs, { lo: 0.5, hi: 6, line: this.opts.line });
 		this.cap = Math.max(64, Math.round(fs * this.opts.windowSec));
@@ -175,7 +248,9 @@ export class FocusEngine {
 			warmingUp: true,
 			calibrating: this.baseline === null,
 			calibrationLeftSec: this.baseline === null ? this.opts.calibrationSec : 0,
-			baseline: this.baseline
+			baseline: this.baseline,
+			fsOk: this.feasibility.ok,
+			fsReason: this.feasibility.reason
 		};
 	}
 
@@ -268,10 +343,12 @@ export class FocusEngine {
 		const k = this.opts.smoothing;
 		if (active > 1e-12) this.calmEma = this.calmEma * k + (bands.alpha / active) * (1 - k);
 
-		// Only trust engagement while the electrode is actually reading a biosignal. With a
-		// detached electrode alpha+theta collapse to the noise floor and E explodes, which
-		// would otherwise read as perfect concentration.
-		if (signalOk) {
+		// Only trust engagement while the electrode is actually reading a biosignal AND the
+		// sample rate can carry beta. With a detached electrode alpha+theta collapse to the
+		// noise floor and E explodes, which would otherwise read as perfect concentration;
+		// at 45/90 SPS mains folds into beta and inflates it the same way. Freezing a
+		// baseline from either would bake the artifact into every later score.
+		if (signalOk && this.feasibility.ok) {
 			if (this.baseline === null) {
 				this.calSamples.push(engagement);
 				if (this.calSamples.length >= this.calNeeded) {
@@ -292,7 +369,7 @@ export class FocusEngine {
 		const calibrating = this.baseline === null;
 		this.metrics = {
 			engagement,
-			focus: calibrating ? 0 : this.scoreEma,
+			focus: calibrating || !this.feasibility.ok ? 0 : this.scoreEma,
 			calm: Math.min(100, this.calmEma * 160),
 			blinks: this.metrics.blinks,
 			bands,
@@ -304,7 +381,9 @@ export class FocusEngine {
 			calibrationLeftSec: calibrating
 				? Math.max(0, (this.calNeeded - this.calSamples.length) / 8)
 				: 0,
-			baseline: this.baseline
+			baseline: this.baseline,
+			fsOk: this.feasibility.ok,
+			fsReason: this.feasibility.reason
 		};
 	}
 }

@@ -1,7 +1,15 @@
 # NeuroSky + Emotiv source support
 
 **Date:** 2026-06-26
-**Status:** Approved
+**Status:** SUPERSEDED — implemented, then removed from the web client on 2026-07-09.
+
+> Both sources were deleted (`thinkgear.ts`, `connectNeuroSky`, `connectEmotiv`, ~300 lines):
+> the ESP32 board is the only hardware BERGER·1 targets, and the Emotiv stub never worked
+> (raw EEG needs the paid Cortex API). This document is kept because it records **why the
+> dead ends were dead ends** — read it before anyone proposes re-adding NeuroSky. The working
+> `ThinkGearParser` is recoverable from git history.
+>
+> See `docs/superpowers/specs/2026-07-09-berger1-analyzer-overhaul-design.md`, section 5.
 
 ## Goal
 

@@ -1,8 +1,18 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { resolve } from '$app/paths';
-	import { NeuroFocus, type AdcProfile } from '$lib/neurofocus';
+	import {
+		NeuroFocus,
+		SWEEP_SEC,
+		UV_PER_DIV,
+		type AdcProfile,
+		type ScopeState
+	} from '$lib/neurofocus';
 	import { RATE_LADDER } from '$lib/ble';
+	import { focusFeasibility } from '$lib/focus';
+	import { bergerFeasibility, type BergerState } from '$lib/berger';
+	import { EXPLAINERS } from '$lib/explainers';
+	import InfoPopover from '$lib/InfoPopover.svelte';
 
 	let app: NeuroFocus | undefined;
 	// Active ADC scaling profile: v2 = ESP32-C3 12-bit unipolar, v4 = ADS1220 24-bit bipolar.
@@ -11,6 +21,21 @@
 	// Runtime ADS1220 output rate (the firmware '~' command). The board reports the live rate
 	// back via INFO, which re-tunes fs; this is just the requested value shown in the picker.
 	let rateSel = $state(175);
+
+	let scope = $state<ScopeState>({
+		sweepSec: 4,
+		uvPerDiv: 'auto',
+		effectiveUvPerDiv: 1,
+		hold: false,
+		secPerDiv: 0.5
+	});
+	let berger = $state<BergerState | null>(null);
+
+	// The focus score is only defensible where beta fits under Nyquist AND 60 Hz mains can be
+	// notched. On the firmware ladder that is 175 SPS and up; the lower rungs stay selectable
+	// for raw-signal debugging but are labelled so nobody reads a score off them.
+	const rateNote = (sps: number): string => (focusFeasibility(sps, 60).ok ? '' : ' · no focus');
+	const bergerNote = (sps: number): string => (bergerFeasibility(sps).ok ? '' : ' · no alpha test');
 
 	function setAdc(p: AdcProfile): void {
 		adc = p;
@@ -25,8 +50,31 @@
 		void app?.connectBLE(adc);
 	}
 
+	function onSweep(e: Event): void {
+		const v = Number((e.currentTarget as HTMLSelectElement).value);
+		app?.setSweep(v as (typeof SWEEP_SEC)[number]);
+	}
+
+	function onUvPerDiv(e: Event): void {
+		const raw = (e.currentTarget as HTMLSelectElement).value;
+		app?.setUvPerDiv(raw === 'auto' ? 'auto' : (Number(raw) as (typeof UV_PER_DIV)[number]));
+	}
+
+	const phaseLabel = (b: BergerState): string =>
+		b.phase === 'ready'
+			? `GET READY · ${b.secondsLeft}s`
+			: b.phase === 'open'
+				? `EYES OPEN · ${b.secondsLeft}s`
+				: b.phase === 'closed'
+					? `EYES CLOSED · ${b.secondsLeft}s`
+					: b.phase === 'done'
+						? 'COMPLETE'
+						: b.phase.toUpperCase();
+
 	onMount(() => {
 		app = new NeuroFocus();
+		app.onScopeChange((s) => (scope = s));
+		app.onBergerChange((s) => (berger = s));
 		app.mount();
 		return () => app?.destroy();
 	});
@@ -166,8 +214,9 @@
 			>
 				<div style="display:flex;justify-content:space-between;align-items:center;flex:none">
 					<span
-						style="font:600 10px 'Saira Condensed';letter-spacing:2.5px;color:rgba(140,235,168,.7)"
-						>EEG ACTIVITY · CH1 · BAND-PASS 1–45 Hz</span
+						style="display:flex;align-items:center;gap:6px;font:600 10px 'Saira Condensed';letter-spacing:2.5px;color:rgba(140,235,168,.7)"
+						>EEG ACTIVITY · CH1 · BAND-PASS 1–45 Hz · NOTCH 60 Hz
+						<InfoPopover explainer={EXPLAINERS.scope} /></span
 					>
 					<div style="display:flex;align-items:center;gap:8px">
 						<!-- ADC SCALING PROFILE toggle: swaps counts→µV between the v2 12-bit
@@ -194,8 +243,51 @@
 									: 'background:transparent;color:rgba(140,235,168,.55)'}">V4 · 24-bit</button
 							>
 						</div>
-						<span style="font:400 10px 'Space Mono',monospace;color:rgba(140,235,168,.45)"
-							>µV · 4 s SWEEP</span
+						<!-- Oscilloscope H/V. At 2000 SPS a fixed 4 s sweep with per-frame peak gain
+						     is an unreadable noise band; these make it debuggable. -->
+						<select
+							aria-label="Sweep (seconds across screen)"
+							value={scope.sweepSec}
+							onchange={onSweep}
+							class="nf-scope-sel"
+						>
+							{#each SWEEP_SEC as s (s)}
+								<option value={s}>{s} s</option>
+							{/each}
+						</select>
+						<select
+							aria-label="Vertical gain (µV per division)"
+							value={String(scope.uvPerDiv)}
+							onchange={onUvPerDiv}
+							class="nf-scope-sel"
+						>
+							<option value="auto">AUTO</option>
+							{#each UV_PER_DIV as v (v)}
+								<option value={String(v)}>{v} µV/div</option>
+							{/each}
+						</select>
+						<button
+							type="button"
+							class="nf-scope-btn"
+							title="Fit the 99.5th-percentile amplitude and return to a 4 s sweep"
+							onclick={() => app?.autoset()}>AUTOSET</button
+						>
+						<button
+							type="button"
+							class="nf-scope-btn"
+							class:on={scope.hold}
+							title="Freeze the trace"
+							onclick={() => app?.setHold(!scope.hold)}>{scope.hold ? 'RUN' : 'HOLD'}</button
+						>
+						<span
+							style="font:400 10px 'Space Mono',monospace;color:rgba(140,235,168,.45);white-space:nowrap"
+							id="nf-scope-label"
+							>{scope.secPerDiv < 1
+								? `${(scope.secPerDiv * 1000).toFixed(0)} ms`
+								: `${scope.secPerDiv} s`}/div ·
+							{scope.effectiveUvPerDiv < 10
+								? scope.effectiveUvPerDiv.toFixed(1)
+								: scope.effectiveUvPerDiv.toFixed(0)} µV/div</span
 						>
 					</div>
 				</div>
@@ -212,11 +304,12 @@
 					style="display:flex;justify-content:space-between;align-items:center;flex:none;padding-top:1px"
 				>
 					<span
-						style="font:600 10px 'Saira Condensed';letter-spacing:2.5px;color:rgba(140,235,168,.7)"
-						>SPECTROGRAM · WATERFALL</span
+						style="display:flex;align-items:center;gap:6px;font:600 10px 'Saira Condensed';letter-spacing:2.5px;color:rgba(140,235,168,.7)"
+						>SPECTROGRAM · WATERFALL
+						<InfoPopover explainer={EXPLAINERS.spectrogram} /></span
 					>
 					<span style="font:400 10px 'Space Mono',monospace;color:rgba(140,235,168,.45)"
-						>0–45 Hz · dB</span
+						>0–45 Hz · dB · relative</span
 					>
 				</div>
 				<div
@@ -239,8 +332,9 @@
 				>
 					<div style="display:flex;justify-content:space-between;align-items:center;flex:none">
 						<span
-							style="font:600 10px 'Saira Condensed';letter-spacing:2.5px;color:rgba(255,190,110,.78)"
-							>SPECTRUM · WELCH PSD</span
+							style="display:flex;align-items:center;gap:6px;font:600 10px 'Saira Condensed';letter-spacing:2.5px;color:rgba(255,190,110,.78)"
+							>SPECTRUM · WELCH PSD · 10 s TRAILING
+							<InfoPopover explainer={EXPLAINERS.psd} align="right" /></span
 						>
 						<span
 							style="display:flex;align-items:center;gap:5px;font:400 9px 'Saira Condensed';letter-spacing:1.5px;color:rgba(255,190,110,.5)"
@@ -267,8 +361,9 @@
 				>
 					<div style="display:flex;justify-content:space-between;align-items:center;flex:none">
 						<span
-							style="font:600 10px 'Saira Condensed';letter-spacing:2.5px;color:rgba(255,190,110,.78)"
-							>BAND POWER</span
+							style="display:flex;align-items:center;gap:6px;font:600 10px 'Saira Condensed';letter-spacing:2.5px;color:rgba(255,190,110,.78)"
+							>BAND POWER
+							<InfoPopover explainer={EXPLAINERS.bands} align="right" /></span
 						>
 						<span style="font:400 10px 'Space Mono',monospace;color:rgba(255,190,110,.45)"
 							>δ θ α β γ</span
@@ -310,19 +405,11 @@
 						title="Link the ESP32 board over Web Bluetooth using the selected ADC profile"
 						>∿ ESP32 · {adc.toUpperCase()}</button
 					>
-					<button class="nf-btn nf-src" onclick={() => app?.connectNeuroSky()}>∿ NeuroSky</button>
-					<button
-						class="nf-btn nf-src nf-disabled"
-						onclick={() => app?.connectEmotiv()}
-						title="Emotiv Cortex API — coming soon">⌁ Emotiv</button
-					>
 					<button class="nf-btn nf-src nf-stop" onclick={() => app?.stopAll()}>■ Stop</button>
 				</div>
 				<span style="font:500 9px 'Space Mono',monospace;letter-spacing:.3px;color:#8a8068"
-					>ESP32 → pick the profile matching your board (V4 = ADS1220 @ 175 SPS). NeuroSky → pair
-					the MindWave, then click NeuroSky and pick its serial port (<b style="color:#6a6149"
-						>MindWaveMobile</b
-					>). Chrome / Edge desktop · no app needed.</span
+					>ESP32 → pick the profile matching your board (V4 = ADS1220, boots at 175 SPS). Chrome /
+					Edge desktop · no app needed.</span
 				>
 			</div>
 
@@ -368,7 +455,7 @@
 						onchange={() => setRate(rateSel)}
 					>
 						{#each RATE_LADDER as r (r)}
-							<option value={r}>{r} SPS</option>
+							<option value={r}>{r} SPS{rateNote(r)}{bergerNote(r)}</option>
 						{/each}
 					</select>
 					<span style="font:500 9px 'Space Mono',monospace;color:#8a8068"
@@ -388,26 +475,60 @@
 				style="display:flex;flex-direction:column;gap:7px;padding:8px 12px;border-radius:9px;background:rgba(0,0,0,.045);box-shadow:inset 0 1px 2px rgba(0,0,0,.08),0 1px 0 rgba(255,255,255,.4)"
 			>
 				<span
-					style="font:600 9px 'Saira Condensed';letter-spacing:3px;color:#6a6149;text-shadow:0 1px 0 rgba(255,255,255,.5)"
-					>ALPHA TEST · EYES OPEN / CLOSED</span
+					style="display:flex;align-items:center;gap:6px;font:600 9px 'Saira Condensed';letter-spacing:3px;color:#6a6149;text-shadow:0 1px 0 rgba(255,255,255,.5)"
+					>ALPHA TEST · EYES OPEN / CLOSED
+					<InfoPopover explainer={EXPLAINERS.berger} /></span
 				>
 				<div style="display:flex;gap:8px;align-items:center">
-					<button
-						class="nf-btn"
-						onclick={() => app?.captureOpen()}
-						style="display:flex;align-items:center;gap:7px;cursor:pointer;border-radius:7px;padding:8px 12px 9px;font:600 11px 'Saira Condensed';letter-spacing:1.5px;text-transform:uppercase;color:#1f3a5a;background:linear-gradient(180deg,#dfeaf5,#bcd0e6);border:1px solid #96b0cc;box-shadow:0 2px 0 #92acc8,0 4px 6px rgba(0,0,0,.22),inset 0 1px 0 rgba(255,255,255,.7)"
-						><span
-							style="width:9px;height:9px;border-radius:50%;background:#5aa9ff;box-shadow:0 0 5px #5aa9ff"
-						></span>Eyes Open</button
-					>
-					<button
-						class="nf-btn"
-						onclick={() => app?.captureClosed()}
-						style="display:flex;align-items:center;gap:7px;cursor:pointer;border-radius:7px;padding:8px 12px 9px;font:600 11px 'Saira Condensed';letter-spacing:1.5px;text-transform:uppercase;color:#6a4a14;background:linear-gradient(180deg,#f5e9d2,#e6cfa6);border:1px solid #ccb086;box-shadow:0 2px 0 #c8ac82,0 4px 6px rgba(0,0,0,.22),inset 0 1px 0 rgba(255,255,255,.7)"
-						><span
-							style="width:9px;height:9px;border-radius:50%;background:#ffae5a;box-shadow:0 0 5px #ffae5a"
-						></span>Eyes Closed</button
-					>
+					{#if !berger || berger.phase === 'idle' || berger.phase === 'done' || berger.phase === 'aborted'}
+						<button
+							class="nf-btn"
+							onclick={() => app?.bergerStart()}
+							title="Guided 3-block Berger protocol (~2 min). Sit still; follow the cues."
+							style="display:flex;align-items:center;gap:7px;cursor:pointer;border-radius:7px;padding:8px 12px 9px;font:600 11px 'Saira Condensed';letter-spacing:1.5px;text-transform:uppercase;color:#1f3a5a;background:linear-gradient(180deg,#dfeaf5,#bcd0e6);border:1px solid #96b0cc;box-shadow:0 2px 0 #92acc8,0 4px 6px rgba(0,0,0,.22),inset 0 1px 0 rgba(255,255,255,.7)"
+							><span
+								style="width:9px;height:9px;border-radius:50%;background:#5aa9ff;box-shadow:0 0 5px #5aa9ff"
+							></span>Start Test</button
+						>
+					{:else}
+						<button
+							class="nf-btn"
+							onclick={() => app?.bergerAbort()}
+							style="display:flex;align-items:center;gap:7px;cursor:pointer;border-radius:7px;padding:8px 12px 9px;font:600 11px 'Saira Condensed';letter-spacing:1.5px;text-transform:uppercase;color:#6a2414;background:linear-gradient(180deg,#f5dad2,#e6b0a6);border:1px solid #cc8f86;box-shadow:0 2px 0 #c88c82,0 4px 6px rgba(0,0,0,.22),inset 0 1px 0 rgba(255,255,255,.7)"
+							>Abort</button
+						>
+					{/if}
+
+					<!-- Phase + countdown. Without this the old UI silently snapshotted the trailing
+					     10 s whenever you clicked, so nobody knew when to close their eyes. -->
+					<div style="display:flex;flex-direction:column;gap:3px;min-width:122px">
+						<span
+							style="font:700 11px 'Saira Condensed';letter-spacing:1.6px;color:{berger?.phase ===
+							'closed'
+								? '#8a5a14'
+								: berger?.phase === 'open'
+									? '#1f3a5a'
+									: '#6a6149'}">{berger ? phaseLabel(berger) : 'READY'}</span
+						>
+						<div style="display:flex;gap:4px;align-items:center">
+							{#each Array(berger?.blocks ?? 3) as _, i (i)}
+								<span
+									style="width:7px;height:7px;border-radius:50%;background:{berger &&
+									i < berger.block
+										? '#5fa86c'
+										: berger && i === berger.block && berger.phase !== 'idle'
+											? '#c8a02a'
+											: 'rgba(0,0,0,.16)'}"
+								></span>
+							{/each}
+							{#if berger && berger.rejected > 0}
+								<span style="font:500 8px 'Space Mono',monospace;color:#a5622a;margin-left:3px"
+									>{berger.rejected} rejected</span
+								>
+							{/if}
+						</div>
+					</div>
+
 					<div
 						style="position:relative;border-radius:5px;overflow:hidden;background:radial-gradient(135% 130% at 50% 32%,#101a16,#070d0a);box-shadow:inset 0 1px 6px rgba(0,0,0,.85),0 1px 0 rgba(255,255,255,.4)"
 					>
@@ -431,12 +552,22 @@
 					>ALPHA RATIO · C / O</span
 				>
 				<div style="display:flex;align-items:baseline;gap:4px">
+					<!-- '—' not '0.00': before the test runs there is no measurement, and a zero
+					     would read as one. -->
 					<span
 						style="font:700 30px 'DSEG7','Space Mono',monospace;color:#ffb33a;text-shadow:0 0 9px rgba(255,150,40,.55)"
-						id="nf-ratio">0.00</span
+						id="nf-ratio">—</span
 					>
 					<span style="font:400 16px 'Space Mono',monospace;color:rgba(255,190,110,.6)">×</span>
 				</div>
+				<span
+					id="nf-verdict"
+					style="font:700 9px 'Saira Condensed';letter-spacing:2px;color:rgba(255,190,110,.8);min-height:11px"
+				></span>
+				<span
+					style="font:400 8px 'Space Mono',monospace;color:rgba(255,190,110,.35);max-width:150px;text-align:right;line-height:1.35"
+					>around-ear sites see a weaker Berger effect than occipital</span
+				>
 			</div>
 		</div>
 
@@ -536,6 +667,32 @@
 	:global(.nf-btn:active) {
 		transform: translateY(2px);
 		filter: brightness(0.96);
+	}
+	/* Scope H/V controls — live on the dark phosphor bezel, not the bone panel. */
+	:global(.nf-scope-sel),
+	:global(.nf-scope-btn) {
+		cursor: pointer;
+		border-radius: 4px;
+		padding: 3px 7px;
+		font:
+			600 9px 'Space Mono',
+			monospace;
+		letter-spacing: 0.5px;
+		color: rgba(140, 235, 168, 0.75);
+		background: rgba(10, 24, 15, 0.75);
+		border: 1px solid rgba(140, 235, 168, 0.3);
+	}
+	:global(.nf-scope-btn:hover),
+	:global(.nf-scope-sel:hover) {
+		border-color: rgba(140, 235, 168, 0.55);
+		color: rgba(170, 245, 190, 0.95);
+	}
+	:global(.nf-scope-btn.on) {
+		background: rgba(95, 232, 134, 0.85);
+		color: #06120a;
+	}
+	:global(.nf-scope-btn:active) {
+		transform: translateY(1px);
 	}
 	:global(::-webkit-scrollbar) {
 		width: 8px;
