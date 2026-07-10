@@ -49,6 +49,22 @@ export const V4_SAMPLE_RATE = 175;
 /** firmware/v2 EEGData.h SAMPLE_RATE — one sample per notification. */
 export const V2_SAMPLE_RATE = 125;
 
+/**
+ * ADS1220 output-rate ladder — index `i` maps to `RATE_LADDER[i]` SPS. Must match the
+ * firmware (`config.h` / `ads1220_driver.cpp kRateTable`). The rate is runtime-selectable
+ * via the `~<index>` command; the board reports the live value back in its INFO line.
+ */
+export const RATE_LADDER = [20, 45, 90, 175, 330, 600, 1000, 2000] as const;
+
+/** Nearest ladder index for a requested SPS (ties resolve to the lower rate). */
+export function spsToRateIndex(sps: number): number {
+	let best = 0;
+	for (let i = 1; i < RATE_LADDER.length; i++) {
+		if (Math.abs(RATE_LADDER[i] - sps) < Math.abs(RATE_LADDER[best] - sps)) best = i;
+	}
+	return best;
+}
+
 /** BINARY_BATCH frame magic: `[0xE7 0x1E][seq u16 LE][n u8][n x i32 LE]`. */
 const MAGIC_0 = 0xe7;
 const MAGIC_1 = 0x1e;
@@ -523,6 +539,19 @@ export class NeuroLink {
 				resolve(null);
 			});
 		});
+	}
+
+	/**
+	 * Select the ADS1220 output rate at runtime via the firmware `~` command. `sps` is snapped
+	 * to the nearest ladder rate (20..2000). Resolves with the board's INFO after the change so
+	 * the caller can adopt the confirmed rate; the firmware also auto-emits INFO on every change,
+	 * which fires `onInfo` — so a live consumer re-tunes its `fs` without polling.
+	 */
+	async setSampleRate(sps: number): Promise<DeviceInfo | null> {
+		const idx = spsToRateIndex(sps);
+		await this.send('~' + idx);
+		await sleep(250); // let the ADC task apply the change before we read it back
+		return this.info();
 	}
 
 	/**

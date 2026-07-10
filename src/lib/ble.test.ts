@@ -6,7 +6,9 @@ import {
 	describeDiag,
 	frameGap,
 	parseDiag,
-	parseInfo
+	parseInfo,
+	RATE_LADDER,
+	spsToRateIndex
 } from './ble';
 
 /** Build a firmware BINARY_BATCH frame: [0xE7 0x1E][seq u16 LE][n u8][n x i32 LE]. */
@@ -187,6 +189,30 @@ describe('parseInfo', () => {
 	it('an INFO line never parses as DIAG, and vice versa', () => {
 		expect(parseDiag(REAL)).toBeNull();
 		expect(parseInfo('DIAG rail=0 v=OK')).toBeNull();
+	});
+
+	it('adopts a runtime rate change — a second INFO carries the new sps', () => {
+		// The firmware re-emits INFO on every '~' change; the host adopts info.sps each time.
+		expect(parseInfo('INFO fw=v4.1 sps=175 mode=binary_batch batch=6')!.sps).toBe(175);
+		expect(parseInfo('INFO fw=v4.1 sps=1000 mode=binary_batch batch=33')!.sps).toBe(1000);
+		expect(parseInfo('INFO fw=v4.1 sps=2000 mode=binary_batch batch=64')!.batch).toBe(64);
+	});
+});
+
+describe('spsToRateIndex / RATE_LADDER', () => {
+	it('mirrors the firmware ladder exactly (index -> SPS)', () => {
+		expect([...RATE_LADDER]).toEqual([20, 45, 90, 175, 330, 600, 1000, 2000]);
+	});
+
+	it('maps each ladder rate to its own index', () => {
+		RATE_LADDER.forEach((sps, i) => expect(spsToRateIndex(sps)).toBe(i));
+	});
+
+	it('snaps an arbitrary request to the nearest ladder rate', () => {
+		expect(spsToRateIndex(500)).toBe(5); // 600 is closer than 330
+		expect(spsToRateIndex(21)).toBe(0); // clamps to the floor
+		expect(spsToRateIndex(9000)).toBe(7); // clamps to the ceiling (2000)
+		expect(RATE_LADDER[spsToRateIndex(300)]).toBe(330);
 	});
 });
 

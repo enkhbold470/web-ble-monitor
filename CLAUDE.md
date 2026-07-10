@@ -104,12 +104,17 @@ Source of truth is `../neurofocus/firmware/v4/src/` — derive from it, never gu
   ASCII payloads are 7-bit, so `0xE7` can never start one — the sniff is unambiguous.
   **Decoding a binary frame as ASCII yields zero samples**, which is what "connects but
   no data" looks like.
-- **Ask the board for its sample rate; don't hard-code one.** Firmware ≥ v4.1 answers `i`
-  with `INFO fw=v4.1 sps=175 …` on the command characteristic, and `NeuroLink` sends it
-  automatically on connect (`link.deviceInfo`). `V4_SAMPLE_RATE` (175) is only the fallback
-  for older boards. A wrong fs slides every frequency by the same ratio — with the old
-  hard-coded 600, real 10 Hz alpha rendered at ~34 Hz. Never use the *measured* rate either:
-  BLE drops make it sag, which compresses the whole frequency axis.
+- **Ask the board for its sample rate; don't hard-code one — and it CHANGES at runtime.** The
+  firmware's ADS1220 rate is runtime-selectable (the `~<0-7>` command, ladder
+  20/45/90/175/330/600/1000/2000 SPS = `RATE_LADDER` in `ble.ts`). `NeuroLink.setSampleRate(sps)`
+  snaps to the nearest rung and writes `~<idx>`; the board re-emits `INFO` on **every** change, and
+  `NeuroLink` fires `opts.onInfo` — which `neurofocus.ts connectBLE` wires to `setFs(info.sps)`, so
+  the whole DSP chain (Welch window, spectrogram, filter chain) re-tunes live. Firmware ≥ v4.1 also
+  answers `i` on connect (`link.deviceInfo`); `V4_SAMPLE_RATE` (175) is only the pre-v4.1 fallback.
+  A wrong fs slides every frequency by the same ratio — the old hard-coded 600 rendered real 10 Hz
+  alpha at ~34 Hz. Never use the *measured* rate either: BLE drops make it sag and compress the axis.
+  The `+page.svelte` DEVICE panel has a SAMPLE RATE `<select>` bound to `deviceSetRate`. Note the
+  batch size in `INFO` (`batch=`) now scales with the rate (6 at 175, up to 64 at 2000 SPS).
 - **Scaling**: 24-bit bipolar, VREF 3.3 V, PGA 1, AFE (`U12` = AD8422) ×100 → one count is
   ≈ 393.2 nV at the ADC, ≈ 3.93 nV at the electrode. Note the firmware's own `AFE_GAIN` is
   `1.0`, so **DIAG's µV are ADC-referred — ~100× the electrode-referred µV the web app

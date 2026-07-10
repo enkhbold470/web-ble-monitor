@@ -2,15 +2,23 @@
 	import { onMount } from 'svelte';
 	import { resolve } from '$app/paths';
 	import { NeuroFocus, type AdcProfile } from '$lib/neurofocus';
+	import { RATE_LADDER } from '$lib/ble';
 
 	let app: NeuroFocus | undefined;
 	// Active ADC scaling profile: v2 = ESP32-C3 12-bit unipolar, v4 = ADS1220 24-bit bipolar.
 	// This also picks the sample rate on connect, so it must match the board in your hand.
 	let adc = $state<AdcProfile>('v4');
+	// Runtime ADS1220 output rate (the firmware '~' command). The board reports the live rate
+	// back via INFO, which re-tunes fs; this is just the requested value shown in the picker.
+	let rateSel = $state(175);
 
 	function setAdc(p: AdcProfile): void {
 		adc = p;
 		app?.setAdcProfile(p);
+	}
+
+	function setRate(sps: number): void {
+		void app?.deviceSetRate(sps);
 	}
 
 	function connectEsp32(): void {
@@ -346,6 +354,25 @@
 						class="nf-btn nf-src"
 						title="d — on-device signal diagnostic (~1.5 s, stream pauses)"
 						onclick={() => app?.deviceDiag()}>⚕ Diag</button
+					>
+				</div>
+				<div style="display:flex;align-items:center;gap:8px">
+					<span
+						style="font:600 9px 'Saira Condensed';letter-spacing:2px;color:#6a6149;text-shadow:0 1px 0 rgba(255,255,255,.5)"
+						>SAMPLE RATE</span
+					>
+					<select
+						class="nf-btn nf-src nf-neutral"
+						title="~ — set the ADS1220 output rate (20..2000 SPS). The board reports the live rate back and the DSP re-tunes automatically."
+						bind:value={rateSel}
+						onchange={() => setRate(rateSel)}
+					>
+						{#each RATE_LADDER as r (r)}
+							<option value={r}>{r} SPS</option>
+						{/each}
+					</select>
+					<span style="font:500 9px 'Space Mono',monospace;color:#8a8068"
+						>USB serial caps ~1000 SPS; BLE carries the full range</span
 					>
 				</div>
 				<span style="font:500 9px 'Space Mono',monospace;letter-spacing:.3px;color:#8a8068"

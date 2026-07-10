@@ -511,10 +511,20 @@ export class NeuroFocus {
 				this.msg(detail);
 			},
 			onDiag: (d) => this.msg('DIAG ' + (d.verdict ?? '') + ' — ' + describeDiag(d)),
-			onStatusText: (line) => this.msg('device: ' + line)
+			onStatusText: (line) => this.msg('device: ' + line),
+			// The board's sample rate is runtime-selectable ('~' command). Every INFO line —
+			// on connect AND after any rate change — carries the live sps, so we re-tune the
+			// whole DSP chain here. This is the single point that keeps fs honest.
+			onInfo: (info) => {
+				if (info.sps && Math.abs(info.sps - this.fs) > 0.5) {
+					this.setFs(info.sps);
+					this.msg(`device rate → ${info.sps} SPS (batch ${info.batch ?? '?'})`);
+				}
+			}
 		});
 		this.stopDemo();
 		this.reset();
+		// Provisional fs until the board's INFO arrives (connect() sends 'i'); onInfo corrects it.
 		this.setFs(BLE_SAMPLE_RATE[version]);
 		this.unit = 'counts';
 		this.setAdcProfile(version);
@@ -541,6 +551,20 @@ export class NeuroFocus {
 			await this.link!.reset();
 			this.reset();
 		}, 'reset complete — streaming');
+	}
+
+	/** Runtime ADS1220 rate change via `~`. The board re-emits INFO, which re-tunes our fs. */
+	async deviceSetRate(sps: number): Promise<void> {
+		if (!this.link?.connected) {
+			this.msg('link a device first');
+			return;
+		}
+		try {
+			const info = await this.link.setSampleRate(sps);
+			this.msg(info?.sps ? `rate → ${info.sps} SPS (batch ${info.batch ?? '?'})` : 'rate command sent');
+		} catch (e) {
+			this.msg('rate change failed: ' + (e instanceof Error ? e.message : String(e)));
+		}
 	}
 
 	async deviceDiag(): Promise<DiagReport | null> {
