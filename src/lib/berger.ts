@@ -1,4 +1,4 @@
-// Guided Berger test — a sample-clocked, deterministic state machine, no DOM, no clock.
+// Guided Berger test — a wall-clock-driven, deterministic state machine, no DOM.
 //
 // Hans Berger (1929) named the alpha rhythm after the first letter he saw appear: a
 // ~10 Hz posterior oscillation that DESYNCHRONISES (shrinks) with the eyes open and
@@ -7,10 +7,11 @@
 // device is reading brain rhythm at all rather than noise.
 //
 // But the textbook 2–5x occipital ratio does NOT apply here. The generator is occipital
-// and this is a single **around-ear** dry channel (never Fp1, never frontal, never
-// prefrontal) sitting far from that generator, so the alpha it sees is heavily attenuated
-// and a modest rise is all we can honestly expect. Hard-coding "1.5x = pass" would be
-// inventing a threshold the physics does not support. Instead the verdict is by
+// and this is a single **around-ear** dry channel (an earpad electrode, physically beside
+// the ear, not on the forehead or above the eyes) sitting far from that generator, so the
+// alpha it sees is heavily attenuated and a modest rise is all we can honestly expect.
+// Hard-coding "1.5x = pass"
+// would be inventing a threshold the physics does not support. Instead the verdict is by
 // CROSS-BLOCK CONSISTENCY: a real Berger effect repeats across every open/closed block,
 // where a fluke or an artifact does not. We ask "did closed beat open in every block?",
 // not "did it beat some magic number?".
@@ -19,6 +20,16 @@
 // facial and jaw muscles, which lowers broadband EMG power. On one channel that muscle
 // relaxation can masquerade as an alpha rise. Averaging over the 8–13 Hz band (not
 // broadband) and rejecting artifact/near-flat sub-epochs limits it, but cannot erase it.
+//
+// WHY THE CLOCK IS WALL-TIME, NOT SAMPLE-TIME. The subject follows the protocol with
+// their eyes and a countdown — they live in wall-clock seconds. Phase transitions must
+// therefore be driven by ELAPSED TIME (`tick()` off a rAF loop), never by a sample count.
+// A sample count is the wrong clock domain the moment the stream is anything but perfect:
+// the synthetic demo pushes fewer than `fs` samples/second and a 123 s protocol used to
+// take >157 s; real BLE drops packets, stretching every epoch; and a stopped stream
+// delivers ZERO samples, freezing the countdown forever. Only the DSP stays sample-based
+// (Welch needs real samples at `fs`): samples fill a sub-epoch buffer whose length is a
+// count, and the wall clock decides which epoch that buffer belongs to.
 
 import { bandPowers, nextPow2, welch, type Psd } from './dsp';
 
@@ -34,6 +45,8 @@ export interface BergerOptions {
 	artifactUv?: number; // default 150 (peak-to-peak reject)
 	rmsFloorUv?: number; // default 1.5 (below this there is no biosignal)
 	onPhaseChange?: (phase: BergerPhase, condition: 'open' | 'closed' | null) => void;
+	/** Monotonic milliseconds. Injected so the protocol is deterministic under test. */
+	now?: () => number;
 }
 
 /** Alpha only reaches 13 Hz, so the Berger test is valid at rates where the focus score is not. */
@@ -106,16 +119,25 @@ export class BergerProtocol {
 		phase: BergerPhase,
 		condition: 'open' | 'closed' | null
 	) => void;
+	private readonly now: () => number;
 
-	private readonly readySamples: number;
-	private readonly epochSamples: number;
-	private readonly settleSamples: number;
+	// Phase durations in MILLISECONDS (the protocol clock). Only subSamples is a count,
+	// because the DSP needs a fixed number of samples at fs, not a duration.
+	private readonly readyMs: number;
+	private readonly epochMs: number;
+	private readonly settleMs: number;
 	private readonly subSamples: number;
 
 	private phase: BergerPhase = 'idle';
 	private block = 0;
 	private condition: 'open' | 'closed' | null = null;
-	private phaseSample = 0; // samples consumed in the current phase
+
+	// Wall-clock anchors, all absolute ms from `now()`. t0 is set at start(); every phase
+	// boundary is derived from t0 + the fixed schedule, so late/lumpy ticks still land epochs
+	// on their exact wall-clock instants.
+	private t0 = 0;
+	private epochStartMs = 0; // start of the current open/closed epoch (== t0 during ready)
+	private phaseEndMs = 0; // instant the current phase ends
 
 	// Current sub-epoch accumulator and the accepted-alpha list for the current epoch.
 	private subBuf: number[] = [];
@@ -143,9 +165,11 @@ export class BergerProtocol {
 		this.artifactUv = options.artifactUv ?? 150;
 		this.rmsFloorUv = options.rmsFloorUv ?? 1.5;
 		this.onPhaseChange = options.onPhaseChange;
-		this.readySamples = Math.round((options.readySec ?? 3) * fs);
-		this.epochSamples = Math.round((options.epochSec ?? 20) * fs);
-		this.settleSamples = Math.round((options.settleSec ?? 2) * fs);
+		this.now =
+			options.now ?? (() => (typeof performance !== 'undefined' ? performance.now() : Date.now()));
+		this.readyMs = (options.readySec ?? 3) * 1000;
+		this.epochMs = (options.epochSec ?? 20) * 1000;
+		this.settleMs = (options.settleSec ?? 2) * 1000;
 		this.subSamples = Math.round((options.subEpochSec ?? 2) * fs);
 	}
 
@@ -153,7 +177,6 @@ export class BergerProtocol {
 	start(): void {
 		this.block = 0;
 		this.condition = null;
-		this.phaseSample = 0;
 		this.subBuf = [];
 		this.epochSubAlphas = [];
 		this.epochTotal = 0;
@@ -169,8 +192,11 @@ export class BergerProtocol {
 		this.closedPsdCount = 0;
 		this.psdFreqs = null;
 		this.result = null;
+		this.t0 = this.now();
+		this.epochStartMs = this.t0;
+		this.phaseEndMs = this.t0 + this.readyMs;
 		this.setPhase('ready', null);
-		this.advance(); // handle a zero-length ready phase
+		this.advance(); // collapse a zero-length ready phase straight into the first epoch
 	}
 
 	/** Stop immediately from any phase; the result stays null (nothing was completed). */
@@ -179,25 +205,31 @@ export class BergerProtocol {
 		this.setPhase('aborted', null);
 	}
 
+	/**
+	 * Advance phases from the wall clock. Call from a rAF loop so the countdown keeps
+	 * running even when no samples arrive (stream stopped, board disconnected).
+	 */
+	tick(): void {
+		if (this.phase === 'ready' || this.phase === 'open' || this.phase === 'closed') this.advance();
+	}
+
 	/** Feed one BAND-PASSED sample in µV (the caller's 1–45 Hz + notch chain output). */
 	push(uv: number): void {
-		if (this.phase === 'ready') {
-			this.phaseSample++;
-			this.advance();
-		} else if (this.phase === 'open' || this.phase === 'closed') {
-			// The first settleSamples of each epoch are the transition/eye-movement/settling
-			// window and are discarded before any sub-epoch accumulates.
-			if (this.phaseSample >= this.settleSamples) {
-				this.subBuf.push(uv);
-				if (this.subBuf.length >= this.subSamples) {
-					this.processSubEpoch(this.subBuf);
-					this.subBuf = [];
-				}
+		// Advance transitions off the wall clock FIRST, so an epoch boundary that falls in
+		// the middle of a batch is honoured before this sample is filed against a phase.
+		this.tick();
+		if (this.phase !== 'open' && this.phase !== 'closed') return;
+		// The first settleMs of each epoch is the transition/eye-movement/settling window and
+		// is discarded before any sub-epoch accumulates.
+		if (this.now() - this.epochStartMs >= this.settleMs) {
+			this.subBuf.push(uv);
+			if (this.subBuf.length >= this.subSamples) {
+				this.processSubEpoch(this.subBuf);
+				this.subBuf = [];
 			}
-			this.phaseSample++;
-			this.advance();
 		}
-		// idle / done / aborted: a no-op, so a late sample can never disturb a finished run.
+		// idle / ready / done / aborted: no sample is buffered, so a late sample can never
+		// disturb a finished run and none accumulates before the first epoch opens.
 	}
 
 	state(): BergerState {
@@ -231,7 +263,11 @@ export class BergerProtocol {
 
 	private enterEpoch(block: number, condition: 'open' | 'closed'): void {
 		this.block = block;
-		this.phaseSample = 0;
+		// Boundaries come from the fixed schedule off t0, never from "when we noticed": ready,
+		// then for each block an open epoch followed by a closed epoch, all of length epochMs.
+		const base = this.t0 + this.readyMs + block * 2 * this.epochMs;
+		this.epochStartMs = condition === 'open' ? base : base + this.epochMs;
+		this.phaseEndMs = this.epochStartMs + this.epochMs;
 		this.subBuf = []; // any trailing partial sub-epoch of the previous phase is dropped here
 		this.epochSubAlphas = [];
 		this.epochTotal = 0;
@@ -239,20 +275,23 @@ export class BergerProtocol {
 	}
 
 	/**
-	 * Advance through as many completed phases as the current sample count allows. The loop
-	 * (rather than a single step) also collapses any zero-length phase straight to the next.
+	 * Advance through every phase whose window has already closed by `now()`. The loop (rather
+	 * than a single step) both collapses a zero-length phase and lets one tick cross MULTIPLE
+	 * boundaries — a backgrounded tab can jump seconds — firing onPhaseChange once per boundary,
+	 * in chronological order, and finalizing each epoch exactly once as its window closes.
 	 */
 	private advance(): void {
 		for (;;) {
+			const t = this.now();
 			if (this.phase === 'ready') {
-				if (this.phaseSample < this.readySamples) return;
+				if (t < this.phaseEndMs) return;
 				this.enterEpoch(0, 'open');
 			} else if (this.phase === 'open') {
-				if (this.phaseSample < this.epochSamples) return;
+				if (t < this.phaseEndMs) return;
 				this.finalizeEpoch();
 				this.enterEpoch(this.block, 'closed');
 			} else if (this.phase === 'closed') {
-				if (this.phaseSample < this.epochSamples) return;
+				if (t < this.phaseEndMs) return;
 				this.finalizeEpoch();
 				if (this.block < this.blocks - 1) this.enterEpoch(this.block + 1, 'open');
 				else return this.finish();
@@ -324,6 +363,8 @@ export class BergerProtocol {
 	}
 
 	private finish(): void {
+		// result MUST be set before the phase flips to 'done' — a consumer reads
+		// state().result synchronously inside the onPhaseChange('done') callback.
 		this.result = this.buildResult();
 		this.setPhase('done', null);
 	}
@@ -361,11 +402,7 @@ export class BergerProtocol {
 	}
 
 	private secondsLeft(): number {
-		let remaining: number;
-		if (this.phase === 'ready') remaining = this.readySamples - this.phaseSample;
-		else if (this.phase === 'open' || this.phase === 'closed')
-			remaining = this.epochSamples - this.phaseSample;
-		else return 0;
-		return Math.ceil(Math.max(0, remaining) / this.fs);
+		if (this.phase !== 'ready' && this.phase !== 'open' && this.phase !== 'closed') return 0;
+		return Math.max(0, Math.ceil((this.phaseEndMs - this.now()) / 1000));
 	}
 }

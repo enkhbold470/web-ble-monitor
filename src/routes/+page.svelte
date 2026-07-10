@@ -23,11 +23,11 @@
 	let rateSel = $state(175);
 
 	let scope = $state<ScopeState>({
-		sweepSec: 4,
+		sweepSec: 8,
 		uvPerDiv: 'auto',
 		effectiveUvPerDiv: 1,
 		hold: false,
-		secPerDiv: 0.5
+		secPerDiv: 1
 	});
 	let berger = $state<BergerState | null>(null);
 
@@ -195,6 +195,20 @@
 					<span
 						style="min-width:42px;text-align:right;font:700 15px 'DSEG7','Space Mono',monospace;color:#e8a23a;background:#0a0f0b;border-radius:4px;padding:3px 7px;box-shadow:inset 0 1px 4px rgba(0,0,0,.85),0 1px 0 rgba(255,255,255,.4)"
 						id="nf-ovf">000</span
+					>
+				</div>
+				<!-- OVF only sees BLE frame-sequence gaps. The firmware's ADC ring drops samples
+				     BEFORE they are framed, silently — so LOSS is the number that actually tells
+				     you the transport cannot carry the selected rate. -->
+				<div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+					<span
+						style="font:600 8px 'Saira Condensed';letter-spacing:2px;color:#6a6149;text-shadow:0 1px 0 rgba(255,255,255,.5)"
+						title="Fraction of the board's samples that never reach the browser. Above ~5% every frequency on screen is inflated by fs/measured."
+						>LOSS</span
+					>
+					<span
+						style="min-width:42px;text-align:right;font:700 15px 'DSEG7','Space Mono',monospace;color:#5fe886;background:#0a0f0b;border-radius:4px;padding:3px 7px;box-shadow:inset 0 1px 4px rgba(0,0,0,.85),0 1px 0 rgba(255,255,255,.4)"
+						id="nf-loss">--</span
 					>
 				</div>
 			</div>

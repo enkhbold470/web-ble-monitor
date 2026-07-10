@@ -17,12 +17,13 @@
 	import { ADC_PROFILES } from '$lib/adc';
 	import {
 		NeuroLink,
+		RATE_LADDER,
 		V4_SAMPLE_RATE,
 		describeDiag,
 		type DiagReport,
 		type LinkState
 	} from '$lib/ble';
-	import { FLOW_THRESHOLD, FocusEngine } from '$lib/focus';
+	import { FLOW_THRESHOLD, FocusEngine, focusFeasibility } from '$lib/focus';
 	import { analyzeSession, verdictText, type FocusSample, type SessionReport } from '$lib/analysis';
 	import {
 		CUBE,
@@ -67,6 +68,10 @@
 	let calibrating = $state(true);
 	let calLeft = $state(0);
 	let rmsUv = $state(0);
+	// Third gate beside signalOk/calibrating: at 20/45/90 SPS the score is not physically
+	// measurable, so the UI must refuse to print one.
+	let fsOk = $state(true);
+	let fsReason = $state<string | null>(null);
 
 	let sps = $state(0);
 	let dropped = $state(0);
@@ -91,12 +96,20 @@
 
 	const linked = $derived(linkState === 'live');
 	const canCommand = $derived(source === 'headset' && linked && !cmdBusy && !diagBusy);
+	// The requested rate shown in the picker. The board is still the authority: every applied
+	// change comes back as INFO, and onInfo re-syncs this.
+	let rateSel = $state(V4_SAMPLE_RATE);
+	// Below 175 SPS the engagement index is not measurable (beta above the passband) or is
+	// contaminated (60 Hz mains folds into beta). Label those rungs rather than hide them —
+	// they are still useful for raw-signal debugging.
+	const rateLabel = (sps: number): string =>
+		`${sps} SPS${focusFeasibility(sps, mains).ok ? '' : ' · no focus'}`;
 	const dropPct = $derived(
 		totalSamples + dropped > 0 ? (dropped / (totalSamples + dropped)) * 100 : 0
 	);
 	const synthetic = $derived(source === 'practice');
 	/** Never show a score we have not earned. */
-	const focusShown = $derived(!calibrating && signalOk);
+	const focusShown = $derived(!calibrating && signalOk && fsOk);
 
 	// ---------- non-reactive ----------
 	let engine = new FocusEngine(FALLBACK_FS, { line: DEFAULT_MAINS });
@@ -144,6 +157,7 @@
 				fwVersion = i.fw ?? '';
 				if (i.sps && i.sps !== fs) {
 					fs = i.sps;
+					rateSel = i.sps; // follow the board, even if another client moved it
 					rebuildEngine();
 					statusMsg = `Board reports ${i.sps} SPS — DSP reconfigured.`;
 				}
@@ -287,6 +301,18 @@
 		runCommand('Asked the board to describe itself (i).', async () => {
 			const i = await link!.info();
 			if (!i) statusMsg = 'No INFO reply — firmware older than v4.1.';
+		});
+
+	/**
+	 * Runtime ADS1220 rate change (`~<idx>`). The board re-emits INFO on every applied change,
+	 * so `onInfo` — not this function — is what actually re-tunes the DSP. Requires firmware
+	 * that understands `~`; older boards silently ignore it and INFO comes back unchanged.
+	 */
+	const cmdRate = (sps: number) =>
+		runCommand(`Sample rate → ${sps} SPS (~).`, async () => {
+			const i = await link!.setSampleRate(sps);
+			if (!i)
+				statusMsg = `Rate command sent; board did not report back — firmware may predate '~'.`;
 		});
 
 	async function cmdDiag() {
@@ -613,6 +639,8 @@
 		calibrating = m.calibrating;
 		calLeft = m.calibrationLeftSec;
 		rmsUv = m.rmsUv;
+		fsOk = m.fsOk;
+		fsReason = m.fsReason;
 		if (link) {
 			sps = link.stats.sps;
 			dropped = link.stats.dropped;
@@ -863,7 +891,25 @@
 					<button class="btn small" onclick={cmdDiag} disabled={!canCommand}>
 						{diagBusy ? 'Running…' : '⚕ Diagnose'}{#if !diagBusy}&nbsp;<kbd>d</kbd>{/if}
 					</button>
+					<label class="rate">
+						<span>RATE</span>
+						<select
+							aria-label="Sample rate"
+							bind:value={rateSel}
+							onchange={() => cmdRate(rateSel)}
+							disabled={!canCommand}
+							title="~ — set the ADS1220 output rate. The board reports the applied rate back via INFO and the DSP re-tunes."
+						>
+							{#each RATE_LADDER as r (r)}
+								<option value={r}>{rateLabel(r)}</option>
+							{/each}
+						</select>
+						<kbd>~</kbd>
+					</label>
 				</div>
+				{#if !fsOk && fsReason}
+					<p class="rate-warn">Focus unavailable at {fs} SPS — {fsReason}.</p>
+				{/if}
 				{#if diagReport}
 					<div class="diag" data-verdict={diagReport.verdict ?? 'ERR'}>
 						<b>{diagReport.error ? 'ERROR' : diagReport.verdict}</b>
@@ -1332,6 +1378,33 @@
 		display: flex;
 		gap: 6px;
 		flex-wrap: wrap;
+	}
+	.rate {
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+		font-size: 11px;
+		letter-spacing: 0.08em;
+		color: #8b98a8;
+	}
+	.rate select {
+		background: #0c111a;
+		color: #cfd8e3;
+		border: 1px solid #2b3543;
+		border-radius: 6px;
+		padding: 4px 6px;
+		font: inherit;
+		cursor: pointer;
+	}
+	.rate select:disabled {
+		opacity: 0.45;
+		cursor: not-allowed;
+	}
+	.rate-warn {
+		margin: 6px 0 0;
+		font-size: 11px;
+		line-height: 1.4;
+		color: #e0a33a;
 	}
 	.diag {
 		background: #0c111a;

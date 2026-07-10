@@ -102,7 +102,7 @@ export class NeuroFocus {
 	// The old trace drew one lineTo per sample over a fixed 4 s window and re-derived the
 	// vertical gain from the visible peak every frame. At 2000 SPS that overplots ~8000
 	// vertices into ~560 px, and the gain always stretched noise to fill the screen.
-	private sweepSec: SweepSec = 4;
+	private sweepSec: SweepSec = 8; // 1 s/div — the setting that reads best on a live headset
 	/** 'auto' keeps auto-ranging, but through a fast-attack/slow-release envelope. */
 	private uvPerDiv: UvPerDiv | 'auto' = 'auto';
 	private autoEnv = 1;
@@ -110,10 +110,15 @@ export class NeuroFocus {
 	private holdBuf: number[] = [];
 	private onScope: ((s: ScopeState) => void) | null = null;
 
+	// ---------- transport sample-loss accounting ----------
+	private lossEma = 0;
+	private lossWarned = false;
+
 	// ---------- guided Berger test ----------
 	private berger: BergerProtocol | null = null;
 	private onBerger: ((s: BergerState | null) => void) | null = null;
 	private beep: AudioContext | null = null;
+	private lastBergerKey = '';
 
 	// ---------- lifecycle ----------
 	mount(): void {
@@ -154,10 +159,14 @@ export class NeuroFocus {
 		this.filtCap = Math.round(fs * (this.psdWindowS + 2));
 		this.hop = Math.round(fs * 0.18);
 		this.chain = dsp.makeChain(fs, { lo: 1, hi: 45, line: this.settings.line });
-		this.welchN = dsp.nextPow2(Math.min(Math.round(fs * 2), 1024));
+		// A ~2 s segment, so the bin width stays <= 0.5 Hz and an alpha peak can actually be
+		// placed. The old `min(fs*2, 1024)` cap meant a 0.51 s window at 2000 SPS — 1.95 Hz
+		// bins, so peakFreq(7..13) had only three answers it could ever give: 7.81, 9.77,
+		// 11.72. A reported "11.7 Hz alpha" was the top bin, not a measurement.
+		this.welchN = Math.max(256, Math.min(4096, dsp.nextPow2(Math.round(fs * 2))));
 		// ~1 s of samples per STFT column. Pinned at 256 this gave 7.8 Hz bins at 2000 SPS
 		// (alpha and theta collapsing into one or two) and a 12.8 s column at 20 SPS.
-		this.nfftSpec = Math.max(128, Math.min(1024, dsp.nextPow2(Math.round(fs))));
+		this.nfftSpec = Math.max(128, Math.min(2048, dsp.nextPow2(Math.round(fs))));
 		this.setText('nf-fs', String(Math.round(fs)));
 		// Every buffer below holds samples filtered at the OLD rate and binned at the old
 		// nfft. Reading them at the new fs slides every frequency by the rate ratio, so the
@@ -220,6 +229,8 @@ export class NeuroFocus {
 		this.holdBuf = [];
 		this.autoEnv = 1;
 		this.ovf = 0;
+		this.lossEma = 0;
+		this.lossWarned = false;
 	}
 
 	private msg(t: string): void {
@@ -260,19 +271,24 @@ export class NeuroFocus {
 			this.drawSpec();
 			const now = performance.now();
 			if (now - this.spsT > 500) {
-				this.setText('nf-sps', String(Math.round((this.spsCount * 1000) / (now - this.spsT))));
-				// Dropped BLE notifications, counted host-side from the frame seq gaps. The
-				// firmware's own ring drops silently at 1000/2000 SPS, so this is the only
-				// place a saturated link becomes visible.
+				const measured = (this.spsCount * 1000) / (now - this.spsT);
+				this.setText('nf-sps', String(Math.round(measured)));
+				// Dropped BLE *notifications*, from the frame seq gaps.
 				if (this.link) this.ovf = this.link.stats.dropped;
 				this.setText('nf-ovf', String(this.ovf));
+				this.updateLoss(measured);
 				this.spsCount = 0;
 				this.spsT = now;
 				// The AUTO gain moves every frame; republish it at the readout cadence rather
 				// than re-rendering the header 60x/s.
 				if (this.uvPerDiv === 'auto') this.emitScope();
 			}
-			if (this.berger) this.emitBerger();
+			if (this.berger) {
+				// Drive the protocol from the wall clock, not from arriving samples: a stopped
+				// stream or a lossy link must not freeze or stretch a countdown a human follows.
+				this.berger.tick();
+				this.emitBerger();
+			}
 			if (now - this.lastPsd > 450 && this.filt.length > this.welchN) {
 				this.lastPsd = now;
 				const seg = this.filt.slice(
@@ -286,6 +302,43 @@ export class NeuroFocus {
 			}
 		};
 		this.raf = requestAnimationFrame(loop);
+	}
+
+	/**
+	 * Samples that never arrive still occupied time on the board.
+	 *
+	 * The DSP spaces every RECEIVED sample by exactly 1/fs, because fs is the board's true ADC
+	 * rate — that is the right call, and re-tuning fs to the measured rate would be worse. But
+	 * it means a shortfall compresses the time base: every frequency slides UP by fs/measured.
+	 *
+	 * This is not hypothetical at the top of the ladder. `syncBatchToRate()` sizes the BLE batch
+	 * as round(fs/30) clamped to BLE_MAX_BATCH=64, so 2000 SPS needs 31.25 notifies/s. A typical
+	 * connection interval sustains ~24, giving 64x24 = 1536 samples/s — and the firmware's
+	 * 256-deep AdcRing drops the remainder with NO counter, so `OVF` (which only sees frame
+	 * sequence gaps) happily reads 0 while a quarter of the data is gone. A real 9 Hz alpha then
+	 * renders at 9 x 2000/1536 = 11.7 Hz.
+	 *
+	 * So: never hide this. Show the shortfall, and say what it does to the axis.
+	 */
+	private updateLoss(measured: number): void {
+		const streaming = measured > 1;
+		const loss = streaming && this.fs > 0 ? Math.max(0, 1 - measured / this.fs) : 0;
+		this.lossEma = this.lossEma * 0.7 + loss * 0.3;
+		const pct = Math.round(this.lossEma * 100);
+		this.setText('nf-loss', streaming ? pct + '%' : '--');
+		const el = this.el('nf-loss');
+		if (el) el.style.color = this.lossEma > 0.05 ? '#ff7a2a' : '#5fe886';
+		// Only a live link can lose samples in transport; the demo's timer jitter is not a fault.
+		if (this.link && this.lossEma > 0.05 && !this.lossWarned) {
+			this.lossWarned = true;
+			const factor = this.fs / Math.max(1, measured);
+			this.msg(
+				`⚠ receiving ${Math.round(measured)} of ${this.fs} SPS — ${pct}% of samples never reach the browser. ` +
+					`Every frequency shown is inflated ×${factor.toFixed(2)} (a real 9 Hz alpha reads ${(9 * factor).toFixed(1)} Hz). ` +
+					`Drop to a rate the link can carry.`
+			);
+		}
+		if (this.lossEma < 0.03) this.lossWarned = false;
 	}
 
 	// ---------- canvas sizing ----------
@@ -360,11 +413,13 @@ export class NeuroFocus {
 		this.emitScope();
 	}
 
-	/** One shot: fit the 99.5th-percentile amplitude and return to a 4 s sweep. */
+	/**
+	 * One shot: fit the 99.5th-percentile amplitude. The timebase is left alone — it is the
+	 * operator's choice of what to look at, and yanking it back would undo their framing.
+	 */
 	autoset(): void {
 		const data = this.visibleWindow();
 		if (data.length >= 2) this.uvPerDiv = autosetUvPerDiv(data);
-		this.sweepSec = 4;
 		this.emitScope();
 		this.msg(`autoset · ${this.sweepSec / 8} s/div · ${this.uvPerDiv} µV/div`);
 	}
@@ -808,24 +863,56 @@ export class NeuroFocus {
 	}
 
 	private emitBerger(): void {
-		this.onBerger?.(this.berger ? this.berger.state() : null);
+		const s = this.berger ? this.berger.state() : null;
+		// Republish only on a material change: this is called every frame, and re-rendering
+		// the phase chip 60x/s for an unchanged countdown is pure waste.
+		const key = s
+			? `${s.phase}|${s.block}|${s.secondsLeft}|${s.accepted}|${s.rejected}|${s.result ? 1 : 0}`
+			: 'idle';
+		if (key === this.lastBergerKey) return;
+		this.lastBergerKey = key;
+		// The subject's eyes are CLOSED for half this test, so the countdown has to be audible.
+		// Tick the last three seconds of every phase.
+		if (s && s.secondsLeft > 0 && s.secondsLeft <= 3 && s.phase !== 'done') {
+			this.tone(1180, 55, 0.035);
+		}
+		this.onBerger?.(s);
 	}
 
-	/** A short cue at every phase change, so the subject never has to watch the screen. */
-	private tone(freq: number, ms = 150): void {
+	/**
+	 * Open the AudioContext inside the click that starts the test.
+	 *
+	 * A context constructed outside a user gesture starts `suspended` under Chrome's autoplay
+	 * policy, and `resume()` from a non-gesture callback will not revive it — so building it
+	 * lazily on the first phase change (3 s later) meant the cues never sounded at all.
+	 */
+	private ensureAudio(): void {
 		try {
 			this.beep ??= new AudioContext();
 			if (this.beep.state === 'suspended') void this.beep.resume();
-			const t = this.beep.currentTime;
-			const osc = this.beep.createOscillator();
-			const gain = this.beep.createGain();
+		} catch {
+			/* audio is a nicety — never let it break the measurement */
+		}
+	}
+
+	/** A short cue at every phase change, so the subject never has to watch the screen. */
+	private tone(freq: number, ms = 150, peak = 0.07): void {
+		const ctx = this.beep;
+		if (!ctx) return;
+		try {
+			if (ctx.state === 'suspended') void ctx.resume();
+			const t = ctx.currentTime;
+			const osc = ctx.createOscillator();
+			const gain = ctx.createGain();
 			osc.type = 'sine';
 			osc.frequency.value = freq;
-			osc.connect(gain).connect(this.beep.destination);
-			gain.gain.setValueAtTime(0.07, t);
+			osc.connect(gain).connect(ctx.destination);
+			// Ramp in and out; a hard gate on a sine clicks audibly.
+			gain.gain.setValueAtTime(0.0001, t);
+			gain.gain.exponentialRampToValueAtTime(peak, t + 0.012);
 			gain.gain.exponentialRampToValueAtTime(0.0001, t + ms / 1000);
 			osc.start(t);
-			osc.stop(t + ms / 1000);
+			osc.stop(t + ms / 1000 + 0.02);
 		} catch {
 			/* audio is a nicety — never let it break the measurement */
 		}
@@ -837,14 +924,25 @@ export class NeuroFocus {
 			this.msg('alpha test unavailable: ' + feas.reason);
 			return;
 		}
+		// MUST happen synchronously inside the click, before anything async — see ensureAudio.
+		this.ensureAudio();
 		this.setText('nf-ratio', '—');
 		this.setText('nf-verdict', '');
+		this.lastBergerKey = '';
 		this.berger = new BergerProtocol(this.fs, {
 			onPhaseChange: (phase, condition) => {
-				if (phase === 'open') this.tone(660);
-				else if (phase === 'closed') this.tone(440);
-				else if (phase === 'done') this.tone(880, 260);
-				if (condition) this.msg(`alpha test · eyes ${condition}`);
+				// Two rising notes = open your eyes; one low note = close them. Distinct enough
+				// to act on without looking, which is the whole point.
+				if (phase === 'ready') this.tone(520, 90, 0.05);
+				else if (phase === 'open') {
+					this.tone(660, 110);
+					window.setTimeout(() => this.tone(880, 130), 130);
+				} else if (phase === 'closed') this.tone(392, 300);
+				else if (phase === 'done') {
+					this.tone(660, 120);
+					window.setTimeout(() => this.tone(988, 300), 140);
+				}
+				if (condition) this.msg(`alpha test · eyes ${condition} — hold still`);
 				if (phase === 'done') this.finishBerger();
 				this.emitBerger();
 			}
