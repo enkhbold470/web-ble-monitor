@@ -145,7 +145,7 @@
 			return;
 		}
 		link = new NeuroLink({
-			onSamples: (counts) => engine.pushCounts(counts, SCALE),
+			onSamples: (counts) => engine.pushCounts(counts.map(c => typeof c === 'number' ? c : c[0]), SCALE),
 			onState: (s, detail) => {
 				linkState = s;
 				statusMsg = detail;

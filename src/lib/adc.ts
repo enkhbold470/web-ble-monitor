@@ -2,7 +2,7 @@
 
 import type { ScaleSettings } from './dsp';
 
-export type AdcProfile = 'v2' | 'v4';
+export type AdcProfile = 'v2' | 'v4' | 'v5';
 
 /**
  * - **v4** — TI ADS1220, 24-bit, differential/bipolar (signed full scale 2^23), external
@@ -21,6 +21,7 @@ export type AdcProfile = 'v2' | 'v4';
  * nominal `offset` need not track exactly.
  */
 export const ADC_PROFILES: Record<AdcProfile, ScaleSettings> = {
+	v5: { adcBits: 24, vref: 4.5, gain: 24, line: 60, bipolar: true, offset: 0 },
 	v4: { adcBits: 24, vref: 3.3, gain: 100, line: 60, bipolar: true, offset: 0 },
 	v2: { adcBits: 12, vref: 3.3, gain: 11000, line: 60, bipolar: false, offset: 2048 }
 };

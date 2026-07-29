@@ -21,6 +21,13 @@ export const BLE_CMD = 'b5e3d1c9-8a2f-4e7b-9c6d-1a3f5e7b9c2d';
 /** `BLE_DEVICE_NAME` is "NEUROFOCUS_V4_headphone"; boards vary by suffix. */
 export const BLE_NAME_PREFIX = 'NEUROFOCUS';
 
+// V5 UUIDs
+export const BLE_SERVICE_V5 = 'e71e0000-1234-5678-9abc-def012345678';
+export const BLE_DATA_V5 = 'e71e0001-1234-5678-9abc-def012345678';
+export const BLE_CMD_V5 = 'e71e0002-1234-5678-9abc-def012345678';
+export const BLE_INFO_V5 = 'e71e0003-1234-5678-9abc-def012345678';
+export const BLE_STATUS_V5 = 'e71e0004-1234-5678-9abc-def012345678';
+
 /** OpenBCI-style single-byte commands (config.h CMD_*). */
 export const CMD = {
 	/** `b` — STREAM_START. Also auto-issued by the firmware on BLE connect. */
@@ -81,8 +88,8 @@ export type FrameKind = 'binary' | 'ascii' | 'text' | 'empty';
 
 export interface DecodedFrame {
 	kind: FrameKind;
-	/** Raw signed ADC counts. Never converted to µV here — that needs the ADC profile. */
-	samples: number[];
+	/** Raw signed ADC counts. Number for 1-ch, number[] for multi-channel. */
+	samples: (number | number[])[];
 	/** BINARY_BATCH: u16 frame counter, wraps at 65536. Gaps mean dropped notifications. */
 	seq?: number;
 	/** BINARY_BATCH: sample count the frame claimed to carry. */
@@ -97,6 +104,20 @@ export interface DecodedFrame {
 	text?: string;
 }
 
+export interface V5Status {
+	vbat_mv: number;
+	vbat_pct: number;
+	ax: number;
+	ay: number;
+	az: number;
+	gx: number;
+	gy: number;
+	gz: number;
+	is_charging: boolean;
+	is_full: boolean;
+	rssi: number | null;
+}
+
 /**
  * Decode one data-characteristic notification. The firmware picks its wire format at
  * compile time (`BLE_DATA_MODE`), so detect rather than assume:
@@ -107,7 +128,7 @@ export interface DecodedFrame {
  *
  * ASCII payloads are all 7-bit, so `0xE7` can never begin one — the sniff is unambiguous.
  */
-export function decodeFrame(input: DataView | Uint8Array): DecodedFrame {
+export function decodeFrame(input: DataView | Uint8Array, isV5 = false): DecodedFrame {
 	const view =
 		input instanceof DataView
 			? input
@@ -118,13 +139,33 @@ export function decodeFrame(input: DataView | Uint8Array): DecodedFrame {
 	if (len >= BINARY_HEADER_BYTES && view.getUint8(0) === MAGIC_0 && view.getUint8(1) === MAGIC_1) {
 		const seq = view.getUint16(2, true);
 		const declared = view.getUint8(4);
-		// A notification is capped at ATT_MTU-3. If the central negotiated a small MTU the
-		// tail is silently cut, so trust the byte count over the declared count.
-		const available = (len - BINARY_HEADER_BYTES) >> 2;
-		const n = Math.min(declared, available);
-		const samples = new Array<number>(n);
-		for (let i = 0; i < n; i++) samples[i] = view.getInt32(BINARY_HEADER_BYTES + i * 4, true);
-		return { kind: 'binary', samples, seq, declared, truncated: n < declared };
+		
+		if (isV5) {
+			// V5: int24 big-endian, 8 channels
+			const num_ch = 8;
+			const availableBytes = len - BINARY_HEADER_BYTES;
+			const availableSamples = Math.floor(availableBytes / (num_ch * 3));
+			const n = Math.min(declared, availableSamples);
+			const samples = new Array<number[]>(n);
+			for (let i = 0; i < n; i++) {
+				const frame = new Array<number>(num_ch);
+				for (let c = 0; c < num_ch; c++) {
+					const off = BINARY_HEADER_BYTES + i * num_ch * 3 + c * 3;
+					let v = (view.getUint8(off) << 16) | (view.getUint8(off + 1) << 8) | view.getUint8(off + 2);
+					if (v & 0x800000) v -= 0x1000000;
+					frame[c] = v;
+				}
+				samples[i] = frame;
+			}
+			return { kind: 'binary', samples, seq, declared, truncated: n < declared };
+		} else {
+			// V4: int32 little-endian, 1 channel
+			const available = (len - BINARY_HEADER_BYTES) >> 2;
+			const n = Math.min(declared, available);
+			const samples = new Array<number>(n);
+			for (let i = 0; i < n; i++) samples[i] = view.getInt32(BINARY_HEADER_BYTES + i * 4, true);
+			return { kind: 'binary', samples, seq, declared, truncated: n < declared };
+		}
 	}
 
 	const raw = textDecoder.decode(new Uint8Array(view.buffer, view.byteOffset, len));
@@ -336,9 +377,10 @@ export interface LinkStats {
 }
 
 export interface NeuroLinkOptions {
-	onSamples?: (counts: number[], frame: DecodedFrame) => void;
+	onSamples?: (counts: (number | number[])[], frame: DecodedFrame) => void;
 	onState?: (state: LinkState, detail: string) => void;
 	onDiag?: (report: DiagReport) => void;
+	onStatus?: (status: V5Status) => void;
 	/** The board's self-description, from `i` or from its boot banner. */
 	onInfo?: (info: DeviceInfo) => void;
 	/** Any other text notified on the command characteristic. */
@@ -383,6 +425,7 @@ export class NeuroLink {
 	private dev: Ble = null;
 	private dataChar: Ble = null;
 	private cmdChar: Ble = null;
+	private statusChar: Ble = null;
 
 	/** True between connect() and disconnect() — gates auto-reconnect. */
 	private wanted = false;
@@ -393,6 +436,7 @@ export class NeuroLink {
 	private infoWaiters: ((i: DeviceInfo) => void)[] = [];
 	/** Last INFO the board sent, if it is new enough to send one. */
 	deviceInfo: DeviceInfo | null = null;
+	private isV5 = false;
 
 	// drop accounting
 	private lastSeq: number | null = null;
@@ -405,6 +449,7 @@ export class NeuroLink {
 
 	private readonly onData = (e: Event): void => this.handleData(e);
 	private readonly onCmd = (e: Event): void => this.handleCmd(e);
+	private readonly onStatusChange = (e: Event): void => this.handleStatus(e);
 	private readonly onDrop = (): void => this.handleDrop();
 	private readonly onPageHide = (): void => {
 		// Free the ESP32's single central slot before the tab dies, or the next
@@ -442,8 +487,8 @@ export class NeuroLink {
 		// Filter on the service (the firmware advertises it) but also accept the name, in
 		// case a long GAP name pushed the 128-bit UUID out of the advertising packet.
 		const dev: Ble = await nav.bluetooth!.requestDevice({
-			filters: [{ services: [BLE_SERVICE] }, { namePrefix: BLE_NAME_PREFIX }],
-			optionalServices: [BLE_SERVICE]
+			filters: [{ services: [BLE_SERVICE] }, { services: [BLE_SERVICE_V5] }, { namePrefix: BLE_NAME_PREFIX }, { namePrefix: 'NeuroFocus' }],
+			optionalServices: [BLE_SERVICE, BLE_SERVICE_V5]
 		});
 
 		this.dev = dev;
@@ -463,7 +508,7 @@ export class NeuroLink {
 			if (this.opts.autoStart !== false) {
 				// The firmware auto-starts on connect; this is belt-and-braces after a `v` reset.
 				try {
-					await this.send(CMD.START);
+					await this.send(this.isV5 ? new Uint8Array([0x01]) : CMD.START);
 				} catch {
 					/* streaming already running */
 				}
@@ -484,7 +529,7 @@ export class NeuroLink {
 		this.generation++;
 		if (this.connected) {
 			try {
-				await this.send(CMD.STOP);
+				await this.send(this.isV5 ? new Uint8Array([0x00]) : CMD.STOP);
 			} catch {
 				/* the board stops streaming on disconnect anyway */
 			}
@@ -498,12 +543,17 @@ export class NeuroLink {
 
 	/** `b` — start streaming. */
 	start(): Promise<void> {
-		return this.send(CMD.START);
+		return this.send(this.isV5 ? new Uint8Array([0x01]) : CMD.START);
 	}
 
-	/** `s` — stop streaming. The board stays connected and still accepts commands. */
+	/** `s` — stop streaming. */
 	stop(): Promise<void> {
-		return this.send(CMD.STOP);
+		return this.send(this.isV5 ? new Uint8Array([0x00]) : CMD.STOP);
+	}
+
+	/** `v` — resets the ADS1220 and pauses streaming. */
+	resetAdc(): Promise<void> {
+		return this.send(CMD.RESET);
 	}
 
 	/**
@@ -523,6 +573,7 @@ export class NeuroLink {
 	 * sample rate rather than a compiled-in constant.
 	 */
 	info(timeoutMs = 2500): Promise<DeviceInfo | null> {
+		if (this.isV5) return Promise.resolve(null); // INFO is a separate characteristic in V5
 		return new Promise<DeviceInfo | null>((resolve) => {
 			const timer = setTimeout(() => {
 				this.infoWaiters = this.infoWaiters.filter((w) => w !== waiter);
@@ -583,9 +634,9 @@ export class NeuroLink {
 	}
 
 	/** Write one command byte to the command characteristic. */
-	async send(cmd: Command | string): Promise<void> {
+	async send(cmd: Command | string | Uint8Array): Promise<void> {
 		if (!this.cmdChar) throw new Error('Not connected — link up before sending commands.');
-		const payload = textEncoder.encode(cmd);
+		const payload = cmd instanceof Uint8Array ? cmd : textEncoder.encode(cmd);
 		const char = this.cmdChar;
 		await this.gatt(async () => {
 			// The characteristic advertises WRITE and WRITE_NR. Prefer the acknowledged write
@@ -631,9 +682,19 @@ export class NeuroLink {
 				await sleep(SETTLE_MS[attempt]);
 				if (!this.dev.gatt.connected) throw new Error('link dropped immediately after connect');
 
-				const svc = await server.getPrimaryService(BLE_SERVICE);
-				this.dataChar = await svc.getCharacteristic(BLE_DATA);
-				this.cmdChar = await svc.getCharacteristic(BLE_CMD);
+				let svc;
+				let isV5 = false;
+				try {
+					svc = await server.getPrimaryService(BLE_SERVICE_V5);
+					isV5 = true;
+				} catch (e) {
+					svc = await server.getPrimaryService(BLE_SERVICE);
+				}
+
+				this.isV5 = isV5;
+				this.cmdChar = await svc.getCharacteristic(isV5 ? BLE_CMD_V5 : BLE_CMD);
+				this.dataChar = await svc.getCharacteristic(isV5 ? BLE_DATA_V5 : BLE_DATA);
+				if (isV5) this.statusChar = await svc.getCharacteristic(BLE_STATUS_V5).catch(() => null);
 				return;
 			} catch (e) {
 				last = e;
@@ -660,6 +721,13 @@ export class NeuroLink {
 		} catch {
 			/* DIAG replies will time out; streaming is unaffected */
 		}
+
+		if (this.statusChar) {
+			try {
+				await this.gatt(() => this.statusChar.startNotifications());
+				this.statusChar.addEventListener('characteristicvaluechanged', this.onStatusChange);
+			} catch {}
+		}
 	}
 
 	private async teardown(): Promise<void> {
@@ -667,15 +735,17 @@ export class NeuroLink {
 		try {
 			this.dataChar?.removeEventListener('characteristicvaluechanged', this.onData);
 			this.cmdChar?.removeEventListener('characteristicvaluechanged', this.onCmd);
+			this.statusChar?.removeEventListener('characteristicvaluechanged', this.onStatusChange);
 			if (this.dev?.gatt?.connected) {
 				await this.gatt(() => this.dataChar?.stopNotifications() ?? Promise.resolve());
+				if (this.statusChar) await this.gatt(() => this.statusChar.stopNotifications() ?? Promise.resolve());
 				this.dev.gatt.disconnect();
 			}
 		} catch {
 			/* teardown is best-effort */
 		}
 		this.dev?.removeEventListener('gattserverdisconnected', this.onDrop);
-		this.dataChar = this.cmdChar = this.dev = null;
+		this.dataChar = this.cmdChar = this.statusChar = this.dev = null;
 		this.diagWaiters = [];
 		this.infoWaiters = [];
 	}
@@ -725,7 +795,7 @@ export class NeuroLink {
 	private handleData(e: Event): void {
 		const value = (e.target as { value?: DataView }).value;
 		if (!value) return;
-		const frame = decodeFrame(value);
+		const frame = decodeFrame(value, this.isV5);
 		this.stats.frames++;
 		if (frame.truncated) this.stats.truncated++;
 		if (frame.kind === 'text') {
@@ -803,6 +873,32 @@ export class NeuroLink {
 			return;
 		}
 		this.opts.onStatusText?.(line);
+	}
+
+	private handleStatus(e: Event): void {
+		if (!this.opts.onStatus) return;
+		const view = (e.target as { value?: DataView }).value;
+		if (!view || view.byteLength < 9) return;
+		
+		const vbat_mv = view.getUint16(0, true);
+		const vbat_pct = view.getUint8(2);
+		const gx = view.getInt16(3, true);
+		const gy = view.getInt16(5, true);
+		const gz = view.getInt16(7, true);
+		let ax = 0, ay = 0, az = 0;
+		let is_charging = false;
+		let is_full = false;
+		if (view.byteLength >= 10) {
+			const flags = view.getUint8(9);
+			is_charging = (flags === 1);
+			is_full = (flags === 2);
+		}
+		let rssi = null;
+		if (view.byteLength >= 11) {
+			rssi = view.getInt8(10);
+		}
+		
+		this.opts.onStatus({ vbat_mv, vbat_pct, ax, ay, az, gx, gy, gz, is_charging, is_full, rssi });
 	}
 
 	private resetCounters(): void {

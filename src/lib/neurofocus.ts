@@ -27,7 +27,11 @@ import {
 	V2_SAMPLE_RATE,
 	V4_SAMPLE_RATE,
 	describeDiag,
-	type DiagReport
+	type DiagReport,
+	type LinkState,
+	type DeviceInfo,
+	type NeuroLinkOptions,
+	type V5Status
 } from './ble';
 
 const GREEK: Record<dsp.BandName, string> = {
@@ -48,6 +52,7 @@ export type { AdcProfile };
  * the whole frequency axis (a real 60 Hz mains line slides toward ~48 Hz).
  */
 export const BLE_SAMPLE_RATE: Record<AdcProfile, number> = {
+	v5: 250,
 	v4: V4_SAMPLE_RATE,
 	v2: V2_SAMPLE_RATE
 };
@@ -71,6 +76,7 @@ export class NeuroFocus {
 
 	private fs = 600;
 	private filt: number[] = [];
+	private filtMulti: number[][] = [];
 	private filtCap = 0;
 	private specCols: Float64Array[] = [];
 	private specCap = 360;
@@ -91,6 +97,7 @@ export class NeuroFocus {
 	private psdWindowS = 10;
 	private welchOverlap = 0.75;
 	private chain: FilterChain | null = null;
+	private chains: FilterChain[] = [];
 
 	private raf = 0;
 	private demoTimer: ReturnType<typeof setInterval> | null = null;
@@ -109,6 +116,17 @@ export class NeuroFocus {
 	private hold = false;
 	private holdBuf: number[] = [];
 	private onScope: ((s: ScopeState) => void) | null = null;
+
+	constructor(
+		private opts: {
+			onScope?: (s: ScopeState) => void;
+			onBerger?: (b: BergerState | null) => void;
+			onStatus?: (s: V5Status) => void;
+		} = {}
+	) {
+		this.onScope = opts.onScope ?? null;
+		this.onBerger = opts.onBerger ?? null;
+	}
 
 	// ---------- transport sample-loss accounting ----------
 	private lossEma = 0;
@@ -159,6 +177,7 @@ export class NeuroFocus {
 		this.filtCap = Math.round(fs * (this.psdWindowS + 2));
 		this.hop = Math.round(fs * 0.18);
 		this.chain = dsp.makeChain(fs, { lo: 1, hi: 45, line: this.settings.line });
+		this.chains = Array.from({ length: 8 }, () => dsp.makeChain(fs, { lo: 1, hi: 45, line: this.settings.line }));
 		// A ~2 s segment, so the bin width stays <= 0.5 Hz and an alpha peak can actually be
 		// placed. The old `min(fs*2, 1024)` cap meant a 0.51 s window at 2000 SPS — 1.95 Hz
 		// bins, so peakFreq(7..13) had only three answers it could ever give: 7.81, 9.77,
@@ -221,10 +240,12 @@ export class NeuroFocus {
 
 	private reset(): void {
 		this.filt = [];
+		this.filtMulti = [];
 		this.specCols = [];
 		this.sampleWin = [];
 		this.hopAcc = 0;
 		this.chain?.reset();
+		if (this.chains) this.chains.forEach(c => c.reset());
 		this.psd = null;
 		this.holdBuf = [];
 		this.autoEnv = 1;
@@ -238,7 +259,7 @@ export class NeuroFocus {
 	}
 
 	// ---------- core ingest (shared by BLE / file / demo) ----------
-	private ingest(value: number, isUv: boolean): void {
+	private ingest(value: number, isUv: boolean, multi?: number[]): void {
 		if (!this.chain) return;
 		const uv = isUv ? value : dsp.countsToUv(value, this.settings);
 		const y = this.chain.step(uv);
@@ -256,10 +277,27 @@ export class NeuroFocus {
 		// rather than sniff a buffer on a timer.
 		this.berger?.push(y);
 		this.spsCount++;
+
+		if (multi && this.chains.length === 8) {
+			if (this.filtMulti.length === 0) this.filtMulti = Array.from({ length: 8 }, () => []);
+			for (let c = 0; c < Math.min(8, multi.length); c++) {
+				const muv = isUv ? multi[c] : dsp.countsToUv(multi[c], this.settings);
+				const my = this.chains[c].step(muv);
+				this.filtMulti[c].push(my);
+				if (this.filtMulti[c].length > this.filtCap) this.filtMulti[c].shift();
+			}
+		}
 	}
 
-	private ingestMany(arr: number[], isUv: boolean): void {
-		for (let i = 0; i < arr.length; i++) this.ingest(arr[i], isUv);
+	private ingestMany(arr: (number | number[])[], isUv: boolean): void {
+		for (let i = 0; i < arr.length; i++) {
+			const item = arr[i];
+			if (typeof item === 'number') {
+				this.ingest(item, isUv);
+			} else {
+				this.ingest(item[0], isUv, item);
+			}
+		}
 	}
 
 	// ---------- render loop ----------
@@ -466,31 +504,73 @@ export class NeuroFocus {
 			h / 2 - Math.max(-1, Math.min(1, v / (uvDiv * (V_DIVS / 2)))) * half;
 
 		x.save();
-		x.shadowColor = 'rgba(102,240,138,.6)';
-		x.shadowBlur = 7;
-		x.strokeStyle = '#86ffa6';
-		x.lineWidth = 1.4;
-		x.beginPath();
-		const cols = Math.max(1, Math.round(w));
-		if (data.length <= cols) {
-			// Fewer samples than pixels — a plain polyline reads better than stubs.
-			for (let i = 0; i < data.length; i++) {
-				const px = (i / (data.length - 1)) * w;
-				const py = Y(data[i]);
-				if (i) x.lineTo(px, py);
-				else x.moveTo(px, py);
+		const hasMulti = this.filtMulti && this.filtMulti.length === 8 && this.filtMulti[0].length > 0;
+		if (hasMulti) {
+			const colors = ['#00e5ff', '#10b981', '#f43f5e', '#a855f7', '#fbbf24', '#3b82f6', '#ec4899', '#f97316'];
+			const n = Math.round(this.sweepSec * this.fs);
+			const multiData = this.filtMulti.map(f => f.slice(-Math.max(0, n)));
+			const cols = Math.max(1, Math.round(w));
+			for (let c = 0; c < 8; c++) {
+				const cdata = multiData[c];
+				if (cdata.length < 2) continue;
+				x.strokeStyle = colors[c];
+				x.lineWidth = 1.0;
+				x.beginPath();
+				if (cdata.length <= cols) {
+					for (let i = 0; i < cdata.length; i++) {
+						const px = (i / (cdata.length - 1)) * w;
+						const py = Y(cdata[i]);
+						if (i === 0) x.moveTo(px, py);
+						else x.lineTo(px, py);
+					}
+				} else {
+					const step = cdata.length / cols;
+					for (let px = 0; px < cols; px++) {
+						const i0 = Math.floor(px * step);
+						const i1 = Math.floor((px + 1) * step);
+						let min = cdata[i0], max = cdata[i0];
+						for (let i = i0 + 1; i < i1; i++) {
+							if (cdata[i] < min) min = cdata[i];
+							if (cdata[i] > max) max = cdata[i];
+						}
+						if (px === 0) x.moveTo(px, Y(cdata[i0]));
+						x.lineTo(px, Y(min));
+						x.lineTo(px, Y(max));
+					}
+				}
+				x.stroke();
 			}
 		} else {
-			// One vertical [min,max] segment per pixel column. Overplotting 8000 vertices
-			// into 560 px is what made 2000 SPS look like a solid noise band.
-			const reduced = minMaxDecimate(data, cols);
-			for (let c = 0; c < reduced.length; c++) {
-				const px = (c / Math.max(1, reduced.length - 1)) * w;
-				x.moveTo(px, Y(reduced[c].max));
-				x.lineTo(px, Y(reduced[c].min));
+			x.shadowColor = 'rgba(102,240,138,.6)';
+			x.shadowBlur = 7;
+			x.strokeStyle = '#86ffa6';
+			x.lineWidth = 1.4;
+			x.beginPath();
+			const cols = Math.max(1, Math.round(w));
+			if (data.length <= cols) {
+				for (let i = 0; i < data.length; i++) {
+					const px = (i / (data.length - 1)) * w;
+					const py = Y(data[i]);
+					if (i === 0) x.moveTo(px, py);
+					else x.lineTo(px, py);
+				}
+			} else {
+				const step = data.length / cols;
+				for (let px = 0; px < cols; px++) {
+					const i0 = Math.floor(px * step);
+					const i1 = Math.floor((px + 1) * step);
+					let min = data[i0], max = data[i0];
+					for (let i = i0 + 1; i < i1; i++) {
+						if (data[i] < min) min = data[i];
+						if (data[i] > max) max = data[i];
+					}
+					if (px === 0) x.moveTo(px, Y(data[i0]));
+					x.lineTo(px, Y(min));
+					x.lineTo(px, Y(max));
+				}
 			}
+			x.stroke();
 		}
-		x.stroke();
 		x.restore();
 
 		x.fillStyle = 'rgba(134,255,166,.55)';
@@ -694,6 +774,7 @@ export class NeuroFocus {
 		await this.link?.disconnect();
 		this.link = new NeuroLink({
 			onSamples: (counts) => this.ingestMany(counts, false),
+			onStatus: (status) => this.opts.onStatus?.(status),
 			onState: (state, detail) => {
 				if (state === 'live') this.setMode('live · ble', '#5fe886');
 				else if (state === 'reconnecting') this.setMode('re-link', '#e8a23a');
